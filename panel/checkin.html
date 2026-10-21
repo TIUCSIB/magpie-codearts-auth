@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<link rel="stylesheet" href="style.css">
+<script src="_magpie/bridge.js"></script>
+<script src="app.js" defer></script>
+
+<div class="card">
+  <label class="toggle">
+    <input type="checkbox" id="auto">
+    <span>每天自动签到</span>
+  </label>
+  <p class="hint" id="autoHint">默认开启：magpie 每次刷新这个账号的额度时会顺带领取当天的签到积分（一天只领一次）。</p>
+</div>
+
+<div class="card">
+  <p class="hint">
+    手动签到：让 agent 调 <code>checkin</code> 工具（magpie 的 MCP：
+    <code>http://127.0.0.1:3425/mcp/magpie/tools</code>）。关掉自动签到后，这个工具仍然会真的去领。
+  </p>
+  <p class="hint">看余额：<code>balance</code> 工具，或 magpie 的额度卡片 / <code>magpie quota</code>。</p>
+</div>
+
+<p class="status" id="status">读取插件选项…</p>

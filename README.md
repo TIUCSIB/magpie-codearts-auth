@@ -6,9 +6,10 @@ inferhub 模型接进 magpie —— Claude Code / Codex / OpenCode / Gemini CLI 
 
 - **OAuth2 登录**：授权码 + PKCE + DPoP(ES256)，和 CodeArts 桌面客户端同一条链路，换回华为云 STS
   临时凭证（AK/SK/SecurityToken），并自动续期；也支持直接填 `x-auth-token`。
-- **余额提醒**：`auth.usage` 钩子把套餐额度、剩余 credits/tokens、到期时间报到 magpie 的账号卡片、
-  `magpie quota` 和 `GET /v1/magpie/quotas`。
-- **签到**：工具 `codearts_checkin`（领取当日权益并回读余额），可选每天自动签到一次。
+- **余额提醒**：`auth.usage` 钩子把积分额度（总额 / 基础套餐 / 赠送）、剩余积分、可用模型报到 magpie 的
+  账号卡片、`magpie quota` 和 `GET /v1/magpie/quotas`。
+- **每日签到**：**默认每天自动领一次**（跟着额度刷新走），额度卡片里会出现「今日签到」这一行；
+  也可以随时让 agent 调工具手动签。供应商页还有一个「每日签到」面板，用来一键开关自动签到。
 
 ## 安装
 
@@ -29,15 +30,20 @@ magpie plugin add ./magpie-codearts-auth
 magpie plugin login codearts        # 选 “Sign in with HUAWEI CodeArts”
 magpie plugin                       # codearts (CodeArts (码道), 4 models)  signed in
 magpie provider test codearts       # 打一个最小请求
-magpie quota                        # 余额 / 额度窗口
+magpie quota                        # 积分额度 / 签到状态
 ```
 
 应用里：插件 → 添加插件 → 填 `TIUCSIB/magpie-codearts-auth`（或文件夹路径）→ 在 `codearts` 这一行点登录，
 浏览器里用华为云账号完成授权。登录成功后 agent 就能用 `codearts/GLM-5.1` 这类模型。
 
+> **工具名前缀**：工具名是 `<插件短名>_<工具名>`。从 GitHub 装（`TIUCSIB/magpie-codearts-auth`）时短名是
+> `magpie-codearts-auth`，所以是 `magpie-codearts-auth_checkin`；从本地文件夹装时短名取文件夹名，
+> 例如 `magpie-codeArt` 会给出 `magpie-codeArt_checkin`。以插件页里列出的名字为准。
+
 > **关于 `bun add https://github.com/…` 报错**：Bun 不认裸 URL（会报 `Invalid dependency name` /
 > `codeload… legacy.tar.gz 404`）。magpie 的 git 安装走 `owner/repo`、`github:owner/repo[#ref]` 或
 > `git+https://…`；另外仓库根目录必须有 `package.json`，插件加载的文件也必须提交进仓库 —— 本仓库满足这两点。
+> （magpie 自己的 `plugin add` 对裸 URL 是宽容的，但那只是 magpie 帮你改写 spec，用 `owner/repo` 更稳。）
 
 ## 端点与鉴权
 
@@ -65,26 +71,49 @@ magpie quota                        # 余额 / 额度窗口
 > `/snap-manager/v1/package/overview` 在客户端代码里存在，但现网返回 `404 APIG.0101`（未发布），所以额度一律取
 > `statistics/plugin`。
 
+## 签到怎么用
+
+签到 = 领 CodeArts 的「每日签到」活动（`USER_LOGIN`，每天 1000 积分），链路是
+`/v1/ops/delivery` 找可领活动 → `/v1/ops/claim` → `/v1/ops/confirm`。
+
+| 方式 | 怎么触发 |
+| --- | --- |
+| **自动（默认）** | 每次额度刷新（打开插件页、`magpie quota`、网关 `GET /v1/magpie/quotas`）都会检查一次，当天没领就直接领。签完额度卡片里多一行「今日签到 · 已领取 +1000 积分」 |
+| 手动 | 让 agent 调 `checkin` 工具（名字见上面的工具名前缀说明） |
+| 开关 | 供应商编辑页底部 → 面板「每日签到」→ 勾掉「每天自动签到」（写进插件选项 `autoCheckin`） |
+| 命令 | `magpie plugin options codearts '{"autoCheckin":false}'` |
+
+签到状态记在 magpie 配置目录的 `codearts-checkin.json`，只用来省一次请求；服务端自己也会对同一天
+重复领取返回不可领，所以不会重复加分。
+
 ## 插件选项
 
 ```bash
-magpie plugin options codearts '{"channel":"benefit","autoCheckin":true}'
+magpie plugin options codearts '{"autoCheckin":true}'
 ```
 
 | 选项 | 默认 | 作用 |
 | --- | --- | --- |
+| `autoCheckin` | **`true`** | 每天自动签到一次；设为 `false` 则只在调用 `checkin` 工具时领 |
 | `channel` | `benefit` | 权益渠道：`benefit` 或 `education`，也是签到时带的渠道参数 |
 | `maasType` | 空 | 给推理请求加 `maas_type` 头。**默认不要填**：账号没有 benefit 渠道时带了它会得到 `4004 benefit not found` |
-| `autoCheckin` | `false` | 每天第一次刷新额度时自动签到一次（状态写在 magpie 配置目录的 `codearts-checkin.json`） |
 | `account` | 空 | 多账号时指定工具用哪个账号（按 accountId / 用户名前缀匹配） |
 
 ## 工具
 
-装了插件后，它们经 magpie 的内置 MCP（`http://127.0.0.1:3425/mcp/magpie/tools`）暴露给所有 agent：
+装了插件后，它们经 magpie 的内置 MCP（`http://127.0.0.1:3425/mcp/magpie/tools`）暴露给所有 agent
+（名字形如 `<插件短名>_checkin`，实际名字以插件页为准）：
 
-- `codearts_checkin` —— 每日签到：找可领的 `USER_LOGIN` 活动并领取，回读积分余额；已签到时如实回复「今日已签到（CLAIMED）」；
-- `codearts_balance` —— 积分余额、额度窗口（总额/基础/赠送）、可用模型；
-- `codearts_welfare` —— 列出福利中心全部活动与领取状态（只读，不自动领取）。
+- `…_checkin` —— 每日签到：找可领的 `USER_LOGIN` 活动并领取，回读积分余额；已签到时如实回复「今日已签到（CLAIMED）」；即使关掉了自动签到，这个工具也会真的去领；
+- `…_balance` —— 积分余额、额度窗口（总额/基础/赠送）、可用模型；
+- `…_welfare` —— 列出福利中心全部活动与领取状态（只读，不自动领取）。
+
+## 界面
+
+- **账号额度卡片**：积分总额 / 基础套餐积分 / 赠送积分三条进度 + 剩余积分 + 「今日签到」状态。
+  卡片上的数字按「已用 / 总量」显示（`amount` 是已用，`limit` 是总量）。
+- **供应商页面板**：底部多一张「每日签到」卡片，一个开关控制自动签到。
+- **图标**：`icon.svg`（`magpie.icon`），插件列表与供应商行都用它。
 
 ## 续期与登录状态
 

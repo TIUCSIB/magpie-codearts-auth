@@ -10,7 +10,9 @@
   },
   "files": [
     "index.mjs",
-    "README.md"
+    "README.md",
+    "icon.svg",
+    "panel"
   ],
   "keywords": [
     "opencode",
@@ -29,11 +31,20 @@
     "test": "bun test"
   },
   "magpie": {
+    "icon": "./icon.svg",
     "maxConcurrency": 4,
+    "panels": [
+      {
+        "slot": "provider",
+        "file": "panel/checkin.html",
+        "title": "每日签到",
+        "titles": { "zh": "每日签到", "en": "Daily check-in" }
+      }
+    ],
     "options": {
       "channel": "benefit",
       "maasType": "",
-      "autoCheckin": false,
+      "autoCheckin": true,
       "account": ""
     }
   }

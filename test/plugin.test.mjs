@@ -198,8 +198,11 @@ describe("额度窗口解析", () => {
     expect(windows[0].name).toBe("对话 tokens");
     expect(windows[0].used).toBeCloseTo(25);
     expect(windows[1].name).toBe("积分总额");
-    expect(windows[1].unit).toBe("credits");
+    expect(windows[1].unit).toBe("积分");
     expect(windows[1].used).toBeCloseTo(6.2897, 3);
+    // amount = 已用、limit = 总量：界面按「已用 / 总量」显示
+    expect(windows[1].amount).toBeCloseTo(974.89);
+    expect(windows[1].limit).toBe(15500);
     expect(windows[1].display).toContain("974.89 / 15500 积分");
     expect(windows[1].display).toContain("14525.11");
   });

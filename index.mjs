@@ -468,9 +468,10 @@ function packageWindows(stats) {
         : isTokens && usedTokens !== undefined
           ? (usedTokens * 100) / tokenAmount
           : undefined,
-      amount: isCredits ? amount : tokenAmount,
+      // amount = 已用，limit = 总量：magpie 的界面按这个顺序显示（反过来会看到「0 / 16500」）
+      amount: isCredits ? used : usedTokens,
       limit: isCredits ? amount : tokenAmount,
-      unit: isCredits ? "credits" : "tokens",
+      unit: isCredits ? "积分" : "tokens",
       display,
       ...(key === "usageTotalPackageCredit" ? { span: 30 * 24 * 3600 } : {}),
     });
@@ -676,22 +677,30 @@ function noClaimableCheckin(items) {
  * 每日签到一条龙：delivery 找可领的 USER_LOGIN 活动 → claim → confirm。
  * 这是 CodeArts 客户端「每日签到领 1000 积分」走的那条链路。
  */
-async function runCheckin(auth) {
+async function runCheckin(auth, { claim = true } = {}) {
   const delivery = await fetchWelfareDelivery(auth);
   if (!delivery.ok) {
     return { status: "unavailable", message: "福利接口不可用（登录可能已失效）" };
   }
   const campaign = pickCheckinCampaign(delivery.items);
   if (!campaign) return noClaimableCheckin(delivery.items);
-  const claim = await claimWelfare(auth, campaign.campaignId);
-  if (!claim.ok) {
-    return { status: "failed", message: claim.message ?? "领取失败", campaign, claim };
+  if (!claim) {
+    // 只读模式：不领取，但把「有可领的签到」如实说出来
+    return {
+      status: "available",
+      message: `可以签到（${campaign.title ?? "每日签到"} +${campaign.benefitAmount ?? "?"}）`,
+      campaign,
+    };
+  }
+  const claimResult = await claimWelfare(auth, campaign.campaignId);
+  if (!claimResult.ok) {
+    return { status: "failed", message: claimResult.message ?? "领取失败", campaign, claim: claimResult };
   }
   let confirmed;
-  if (claim.userBenefitId !== undefined && claim.userBenefitId !== null) {
-    confirmed = await confirmWelfare(auth, claim.userBenefitId);
+  if (claimResult.userBenefitId !== undefined && claimResult.userBenefitId !== null) {
+    confirmed = await confirmWelfare(auth, claimResult.userBenefitId);
   }
-  return { status: "claimed", campaign, claim, confirmed };
+  return { status: "claimed", campaign, claim: claimResult, confirmed };
 }
 
 /** 把福利活动列表转成给人看的几行。 */
@@ -730,11 +739,39 @@ function writeCheckinState(directory, state) {
 
 const today = () => new Date().toISOString().slice(0, 10);
 
+/**
+ * 签到的每日门控：
+ * - `autoCheckin` 打开时，今天没领过就直接领（额度刷新、工具调用都会走到这里）；
+ * - 关掉时只读状态，不领取——但仍然会告诉调用方今天签没签。
+ * 服务端自己会对当天重复领取返回「不可领」，这里的状态文件只是省一次请求的缓存。
+ */
+async function resolveCheckin(auth, options = {}, directory, { force = false } = {}) {
+  const state = directory ? readCheckinState(directory) : {};
+  if (!force && options.autoCheckin !== true && directory && state.lastCheckin === today()) {
+    // 今天已经领过了，直接用缓存，省一次网络往返
+    if (state.lastResult === "claimed") {
+      return { status: "claimed", message: state.lastMessage, campaign: { benefitAmount: state.lastCredit } };
+    }
+    if (state.lastResult === "already") return { status: "already", message: state.lastMessage };
+  }
+  if (!force && options.autoCheckin !== true && !directory) {
+    // 没有状态目录时不能缓存，仍然只读一次状态
+  }
+  const allowClaim = force || options.autoCheckin === true;
+  const result = await runCheckin(auth, { claim: allowClaim });
+  if (directory && allowClaim) {
+    const next = { ...state, lastCheckin: today(), lastResult: result.status, lastMessage: result.message };
+    if (result.campaign?.benefitAmount) next.lastCredit = result.campaign.benefitAmount;
+    writeCheckinState(directory, next);
+  }
+  return result;
+}
+
 // ─── 插件 ─────────────────────────────────────────────────────────────────────
 export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
   // magpie 会把插件函数第二个参数（plugins.json 里这一项的 options）传进来；
   // 拿不到时回落到配置文件，最后用默认值。
-  const defaults = { channel: "benefit", maasType: "", autoCheckin: false, account: "" };
+  const defaults = { channel: "benefit", maasType: "", autoCheckin: true, account: "" };
   const options = { ...defaults };
   let optionsLoaded = false;
   const getOptions = async () => {
@@ -969,32 +1006,19 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
           }
         }
 
-        // 可选：让 magpie 的定期额度刷新顺带完成当天签到
-        if (opts.autoCheckin) {
-          const state = readCheckinState(directory);
-          if (state.lastCheckin !== today()) {
-            state.lastCheckin = today();
-            try {
-              const checkin = await runCheckin(auth);
-              state.lastResult = checkin.status;
-              state.lastMessage = checkin.message;
-              if (checkin.status === "claimed") {
-                state.lastCredit = checkin.campaign?.benefitAmount;
-              }
-              if (checkin.status === "claimed") {
-                result.windows.push({
-                  name: "今日签到",
-                  display: `已领取 +${checkin.campaign?.benefitAmount ?? "?"} 积分`,
-                });
-              } else if (checkin.status === "already") {
-                result.windows.push({ name: "今日签到", display: "今日已签到" });
-              }
-            } catch (error) {
-              state.lastResult = "error";
-              state.lastMessage = String(error?.message ?? error);
-            }
-            writeCheckinState(directory, state);
+        // 签到：默认每天自动领一次；关掉 autoCheckin 后仍会显示今天的签到状态
+        try {
+          const checkin = await resolveCheckin(auth, opts, directory);
+          if (checkin.status === "claimed") {
+            result.windows.push({
+              name: "今日签到",
+              display: `已领取 +${checkin.campaign?.benefitAmount ?? "?"} 积分`,
+            });
+          } else if (checkin.status === "already") {
+            result.windows.push({ name: "今日签到", display: "今日已签到" });
           }
+        } catch (error) {
+          result.windows.push({ name: "今日签到", display: `签到未完成：${String(error?.message ?? error)}` });
         }
 
         return result;
@@ -1094,13 +1118,8 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
           if (!auth?.accessKey) return "未登录 CodeArts，请先在 magpie 里登录该供应商。";
           const opts = await getOptions();
           const channel = args.channel || opts.channel;
-          const result = await runCheckin(auth);
-          const state = readCheckinState(directory);
-          state.lastCheckin = today();
-          state.lastResult = result.status;
-          state.lastMessage = result.message;
-          if (result.campaign?.benefitAmount) state.lastCredit = result.campaign.benefitAmount;
-          writeCheckinState(directory, state);
+          // 工具是用户显式要求，所以就算没开 autoCheckin 也直接领
+          const result = await resolveCheckin(auth, opts, directory, { force: true });
 
           const lines = [];
           if (result.status === "claimed") {
@@ -1112,11 +1131,15 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
             }
           } else if (result.status === "already") {
             lines.push(`今日已签到，明天再来（${result.message}）`);
+          } else if (result.status === "available") {
+            lines.push(
+              `⚠️ 有可领的签到但没领成：${result.message}。可以先确认 magpie 里的账号登录还有效，再重试。`,
+            );
           } else if (result.status === "none") {
             lines.push(`没有可领取的签到活动：${describeCampaigns(result.items ?? [])}`);
           } else {
             lines.push(`⚠️ 签到未完成（${result.status}）：${result.message ?? "未知原因"}`);
-            if (result.status === "unavailable" && !opts.channel) {
+            if (result.status === "unavailable") {
               lines.push("如果是登录失效，请在 magpie 里重新登录该账号。");
             }
           }
@@ -1211,5 +1234,6 @@ export const _internal = {
   noClaimableCheckin,
   describeCampaigns,
   runCheckin,
+  resolveCheckin,
   DEFAULT_MODELS,
 };
