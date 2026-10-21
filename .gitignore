@@ -1,0 +1,10 @@
+# 逆向时从客户端 app.asar 提取的第三方代码，不入库（生成方式见 tools/）
+extracted/
+
+node_modules/
+bun.lock
+
+# 本地临时/日志
+*.log
+.DS_Store
+Thumbs.db
