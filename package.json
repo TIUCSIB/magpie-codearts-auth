@@ -4,6 +4,10 @@
   "description": "Magpie / OpenCode provider plugin for HUAWEI CodeArts (码道): OAuth2 login, balance & quota reminders, daily check-in",
   "type": "module",
   "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./server": "./index.mjs"
+  },
   "files": [
     "index.mjs",
     "README.md"
@@ -16,6 +20,11 @@
     "huaweicloud"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TIUCSIB/magpie-codearts-auth.git"
+  },
+  "homepage": "https://github.com/TIUCSIB/magpie-codearts-auth",
   "scripts": {
     "test": "bun test"
   },
@@ -24,7 +33,8 @@
     "options": {
       "channel": "benefit",
       "maasType": "",
-      "autoCheckin": false
+      "autoCheckin": false,
+      "account": ""
     }
   }
 }

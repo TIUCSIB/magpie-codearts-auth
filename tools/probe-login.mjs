@@ -1,6 +1,6 @@
 // 直接调用插件的 authorize()，确认登录 URL 与回调服务器都能就绪（不会打开浏览器、不会登录）。
 // usage: node probe-login.mjs
-import { CodeArtsAuthPlugin } from "../opencode-codearts-auth/index.mjs";
+import { CodeArtsAuthPlugin } from "../index.mjs";
 
 const hooks = await CodeArtsAuthPlugin({ directory: process.cwd() });
 const method = hooks.auth.methods[0];
