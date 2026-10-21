@@ -310,11 +310,14 @@ describe("请求转发（真实故障的回归测试）", () => {
   // 现场故障：把 AI SDK / magpie 传来的所有头都纳入签名，包括它自己会覆盖掉的
   // authorization，服务端验签失败 → 401 verify ak sk signature fail → magpie 把账号
   // 标记成「需要重新登录」。
+  // 每个用例用独立的 accountId：并发闸门按账号分组，共用同一个 id 会让没读完响应的用例
+  // 把后面的用例全排进队列。
   const account = () => ({
     type: "oauth",
     accessKey: "AK",
     secretKey: "SK",
     securityToken: "ST",
+    accountId: crypto.randomUUID(),
     expires: Date.now() + 3_600_000,
   });
 
@@ -447,6 +450,39 @@ describe("请求转发（真实故障的回归测试）", () => {
       expect(body).toContain("TM.00001041");
       expect(body).toContain("重试 2 次");
       expect(body).toContain("并发");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test("同一账号的在飞请求被掐到 maxInFlight（默认 1）个", async () => {
+    const forward = await loaderFetch(account(), { maxInFlight: 1, concurrencyRetries: 1 });
+    const original = globalThis.fetch;
+    let active = 0;
+    let peak = 0;
+    globalThis.fetch = async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      active -= 1;
+      return new Response('{"ok":true}', { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      // 每个任务自己读完响应再结束：占用要等 body 读完才归还，不能在 Promise.all 里等齐响应
+      const texts = await Promise.all(
+        [0, 1, 2].map(async () => {
+          const response = await forward("https://example.test/api/v2/chat/completions", {
+            method: "POST",
+            body: '{"model":"GLM-5.1"}',
+          });
+          return response.text();
+        }),
+      );
+      expect(peak).toBe(1);
+      expect(texts).toHaveLength(3);
+      const after = await forward("https://example.test/api/v2/chat/completions", { method: "POST", body: "{}" });
+      expect(after.status).toBe(200);
+      await after.text();
     } finally {
       globalThis.fetch = original;
     }

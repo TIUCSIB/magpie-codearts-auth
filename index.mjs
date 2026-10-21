@@ -141,6 +141,95 @@ async function isSessionLimit(response) {
   }
 }
 
+// 按账号的「在飞请求」计数：CodeArts 的并发会话上限是账号级的，插件必须自己排队。
+const inflight = new Map();
+
+function slotKeyOf(auth) {
+  return auth?.accountId || auth?.userName || auth?.userId || auth?.accessKey || "codearts";
+}
+
+function slotState(key) {
+  let state = inflight.get(key);
+  if (!state) {
+    state = { active: 0, queue: [] };
+    inflight.set(key, state);
+  }
+  return state;
+}
+
+/** 拿一个并发位；返回的函数负责归还。排队中被取消会直接抛错。 */
+async function acquireSlot(key, limit, signal) {
+  const state = slotState(key);
+  const release = () => {
+    state.active = Math.max(0, state.active - 1);
+    const next = state.queue.shift();
+    if (next) next();
+  };
+
+  if (state.active < limit) {
+    state.active += 1;
+    return release;
+  }
+
+  await new Promise((resolve, reject) => {
+    const waiter = () => {
+      if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const onAbort = signal
+      ? () => {
+          const index = state.queue.indexOf(waiter);
+          if (index >= 0) state.queue.splice(index, 1);
+          reject(signal.reason ?? new Error("aborted"));
+        }
+      : undefined;
+    if (onAbort) signal.addEventListener("abort", onAbort, { once: true });
+    state.queue.push(waiter);
+  });
+
+  state.active += 1;
+  return release;
+}
+
+/**
+ * 响应被 magpie 读完（或读取方取消、请求被 abort）之后才归还并发位。
+ * 流式答复如果不这样做，下一个请求会在线路还热的时候挤进来，又变成一个服务端会话。
+ */
+function holdSlotUntilBodyEnds(response, release, signal) {
+  if (!response.body) {
+    release();
+    return response;
+  }
+  let done = false;
+  let guard;
+  const finish = () => {
+    if (done) return;
+    done = true;
+    if (guard) clearTimeout(guard);
+    signal?.removeEventListener?.("abort", finish);
+    release();
+  };
+  // 兜底：万一读取方既不读完也不取消（或者 body 被丢弃），别把这个账号永久锁死
+  guard = setTimeout(finish, 5 * 60 * 1000);
+  guard?.unref?.();
+  signal?.addEventListener?.("abort", finish, { once: true });
+  const body = response.body.pipeThrough(
+    new TransformStream({
+      transform(chunk, controller) {
+        controller.enqueue(chunk);
+      },
+      flush() {
+        finish();
+      },
+    }),
+  );
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
 /** 重试仍然被并发上限挡住时，把可操作的说明并进错误信息（保留原有字段，各 agent 仍能解析）。 */
 async function annotateSessionLimit(response, attempts) {
   const text = await response.text();
@@ -209,38 +298,60 @@ async function forwardSigned(auth, opts, input, init) {
   const delayMs = Math.max(0, Number(opts?.concurrencyRetryDelayMs ?? 800));
   const canReplay = typeof rawBody === "string" || rawBody instanceof Uint8Array || rawBody instanceof ArrayBuffer;
 
+  // CodeArts 的配额是「账号级的同时活跃会话 ≤ 3」，所以插件这边自己把同一个账号的在飞请求掐到 1 个：
+  // agent 的多轮/工具调用、magpie 的路由分类器都可能同时打请求，靠 magpie 的账号并发设置挡不住。
+  const limit = Math.max(1, Number(opts?.maxInFlight ?? 1));
+  const release = await acquireSlot(slotKeyOf(auth), limit, init?.signal);
+  let released = false;
+  const releaseOnce = () => {
+    if (released) return;
+    released = true;
+    release();
+  };
+
   let response;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const signed = signRequest({ method, url, headers: signable, body }, auth.accessKey, auth.secretKey);
-    for (const [key, value] of Object.entries(signed)) {
-      if (key.toLowerCase() === "host") continue;
-      headers.set(key, String(value));
+  try {
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const signed = signRequest({ method, url, headers: signable, body }, auth.accessKey, auth.secretKey);
+      for (const [key, value] of Object.entries(signed)) {
+        if (key.toLowerCase() === "host") continue;
+        headers.set(key, String(value));
+      }
+      response = await fetch(input, { ...init, headers });
+      if (!canReplay || attempt === attempts) break;
+      if (!(await isSessionLimit(response))) break;
+      await sleep(delayMs * attempt + Math.floor(Math.random() * 200), init?.signal);
     }
-    response = await fetch(input, { ...init, headers });
-    if (!canReplay || attempt === attempts) break;
-    if (!(await isSessionLimit(response))) break;
-    await sleep(delayMs * attempt + Math.floor(Math.random() * 200), init?.signal);
-  }
 
-  // 退避重试用尽仍然是并发上限：把原因和该怎么做写进错误信息
-  if (await isSessionLimit(response)) return annotateSessionLimit(response, attempts);
+    // 退避重试用尽仍然是并发上限：把原因和该怎么做写进错误信息
+    if (await isSessionLimit(response)) {
+      const annotated = await annotateSessionLimit(response, attempts);
+      releaseOnce();
+      return annotated;
+    }
 
-  // STS 还没到期就 401/403：多半问题不在登录本身，别让 magpie 因此把账号标记成需要重新登录。
-  const expires = Number(auth.expires);
-  if (
-    (response.status === 401 || response.status === 403) &&
-    Number.isFinite(expires) &&
-    Date.now() < expires - 60_000
-  ) {
-    const patched = new Headers(response.headers);
-    patched.set("X-Magpie-Sign-In", "kept");
-    return new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: patched,
-    });
+    // STS 还没到期就 401/403：多半问题不在登录本身，别让 magpie 因此把账号标记成需要重新登录。
+    const expires = Number(auth.expires);
+    if (
+      (response.status === 401 || response.status === 403) &&
+      Number.isFinite(expires) &&
+      Date.now() < expires - 60_000
+    ) {
+      const patched = new Headers(response.headers);
+      patched.set("X-Magpie-Sign-In", "kept");
+      return holdSlotUntilBodyEnds(
+        new Response(response.body, { status: response.status, statusText: response.statusText, headers: patched }),
+        releaseOnce,
+        init?.signal,
+      );
+    }
+
+    // 流式响应的占用要一直持续到 magpie 读完，否则下一个请求立刻挤进来又变成一个会话
+    return holdSlotUntilBodyEnds(response, releaseOnce, init?.signal);
+  } catch (error) {
+    releaseOnce();
+    throw error;
   }
-  return response;
 }
 
 /**
@@ -847,6 +958,7 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
     account: "",
     concurrencyRetries: 3,
     concurrencyRetryDelayMs: 800,
+    maxInFlight: 1,
   };
   const options = { ...defaults };
   let optionsLoaded = false;
