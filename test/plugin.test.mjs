@@ -398,6 +398,60 @@ describe("请求转发（真实故障的回归测试）", () => {
     });
   });
 
+  test("并发会话上限（TM.00001041）会退避重试而不是直接失败", async () => {
+    const forward = await loaderFetch(account(), { concurrencyRetries: 3, concurrencyRetryDelayMs: 1 });
+    const original = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      if (calls < 3) {
+        return new Response(
+          JSON.stringify({
+            error_code: "TM.00001041",
+            error_msg: "并发会话数已达上限(3个)，请关闭部分会话后重试。",
+          }),
+          { status: 400, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response('{"object":"chat.completion"}', { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      const res = await forward("https://example.test/api/v2/chat/completions", {
+        method: "POST",
+        body: '{"model":"GLM-5.1"}',
+      });
+      expect(calls).toBe(3);
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("chat.completion");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test("重试用尽后给出可操作的并发上限说明", async () => {
+    const forward = await loaderFetch(account(), { concurrencyRetries: 2, concurrencyRetryDelayMs: 1 });
+    const original = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = async () => {
+      calls += 1;
+      return new Response(
+        JSON.stringify({ error_code: "TM.00001041", error_msg: "并发会话数已达上限(3个)，请关闭部分会话后重试。" }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      );
+    };
+    try {
+      const res = await forward("https://example.test/api/v2/chat/completions", { method: "POST", body: "{}" });
+      expect(calls).toBe(2);
+      expect(res.status).toBe(400);
+      const body = await res.text();
+      expect(body).toContain("TM.00001041");
+      expect(body).toContain("重试 2 次");
+      expect(body).toContain("并发");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
   test("STS 未过期时 401 会带上 X-Magpie-Sign-In: kept", async () => {
     const forward = await loaderFetch();
     const original = globalThis.fetch;

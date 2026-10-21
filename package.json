@@ -32,7 +32,7 @@
   },
   "magpie": {
     "icon": "./icon.svg",
-    "maxConcurrency": 4,
+    "maxConcurrency": 2,
     "panels": [
       {
         "slot": "provider",
@@ -45,7 +45,9 @@
       "channel": "benefit",
       "maasType": "",
       "autoCheckin": true,
-      "account": ""
+      "account": "",
+      "concurrencyRetries": 3,
+      "concurrencyRetryDelayMs": 500
     }
   }
 }

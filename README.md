@@ -98,6 +98,8 @@ magpie plugin options codearts '{"autoCheckin":true}'
 | `channel` | `benefit` | 权益渠道：`benefit` 或 `education`，也是签到时带的渠道参数 |
 | `maasType` | 空 | 给推理请求加 `maas_type` 头。**默认不要填**：账号没有 benefit 渠道时带了它会得到 `4004 benefit not found` |
 | `account` | 空 | 多账号时指定工具用哪个账号（按 accountId / 用户名前缀匹配） |
+| `concurrencyRetries` | `3` | 撞上并发上限（`TM.00001041`）时的重试次数，1 表示不重试 |
+| `concurrencyRetryDelayMs` | `500` | 重试的基础间隔（毫秒），第 n 次等 `n × 该值 + 随机抖动` |
 
 ## 工具
 
@@ -128,6 +130,7 @@ STS 凭证约 1 小时有效。插件用 `auth.refresh` 在到期前 10 分钟�
 
 | 现象 | 原因与处理 |
 | --- | --- |
+| `400 … TM.00001041 并发会话数已达上限(3个)` | CodeArts 服务端限制**同时进行的会话数为 3**。magpie 每个对话都算一个，插件的账号并发如果设成 3/4 就会撞上，客户端同时开着对话时更容易撞。处理：把 magpie 里这个账号那一行的「并发」调到 **1 或 2**（插件默认值已从 4 改成 2，但已保存过的账号设置不会被默认值覆盖，要手动改），并在 CodeArts 客户端里关掉不用的对话。插件本身也会对 `TM.00001041` 做退避重试（默认 3 次），仍然失败时会把「该怎么做」写进错误信息。 |
 | `401 … Incorrect IAM authentication information: verify ak sk signature fail` | 签名覆盖了会被改写的头（早期版本会把 `authorization` 一起签进去）。0.1.0 起只签白名单头；更新插件即可。 |
 | 账号刚登录就显示「需要重新登录」 | 409/401 被当成登录失效。先修掉上面的 401；插件现在只在真正失效时标记，并在 STS 未过期时加 `kept`。 |
 | `4004 benefit not found` | 账号没有 benefit 权益渠道，却给请求加了 `maas_type=benefit`。把 `maasType` 选项留空。 |

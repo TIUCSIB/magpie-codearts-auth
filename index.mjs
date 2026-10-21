@@ -113,7 +113,61 @@ const SIGNED_HEADERS = [
   "agent-type",
 ];
 
-/** 把 AI SDK 的请求签名后转发到 inferhub。 */
+// CodeArts 服务端限制「同时进行的会话数」（默认 3）。magpie 的账号并发如果设得比它高，
+// 或者同一时刻有别的客户端/agent 在说话，多余的那个请求就会拿到这个业务码。
+const SESSION_LIMIT_CODE = "TM.00001041";
+
+const sleep = (ms, signal) =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason ?? new Error("aborted"));
+    const timer = setTimeout(() => {
+      signal?.removeEventListener?.("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new Error("aborted"));
+    };
+    signal?.addEventListener?.("abort", onAbort, { once: true });
+  });
+
+/** 400 + TM.00001041：并发会话满了。读的是克隆体，原响应仍然可以照常流式返回。 */
+async function isSessionLimit(response) {
+  if (response.status !== 400) return false;
+  try {
+    return (await response.clone().text()).includes(SESSION_LIMIT_CODE);
+  } catch {
+    return false;
+  }
+}
+
+/** 重试仍然被并发上限挡住时，把可操作的说明并进错误信息（保留原有字段，各 agent 仍能解析）。 */
+async function annotateSessionLimit(response, attempts) {
+  const text = await response.text();
+  const hint =
+    `（magpie 已经重试 ${attempts} 次仍未拿到名额。CodeArts 限制同时进行的会话数为 3：` +
+    `请在 CodeArts 客户端里关闭一些对话，或把 magpie 里这个账号的「并发」调到 2 及以下。）`;
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = undefined;
+  }
+  const merged =
+    payload && typeof payload === "object"
+      ? { ...payload, error_msg: `${payload.error_msg ?? ""} ${hint}`.trim() }
+      : { error_code: SESSION_LIMIT_CODE, error_msg: `${text} ${hint}`.trim() };
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.set("content-type", "application/json");
+  return new Response(JSON.stringify(merged), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+/** 把 AI SDK 的请求签名后转发到 inferhub；遇到并发上限时短退避重试。 */
 async function forwardSigned(auth, opts, input, init) {
   const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
   const method = init?.method ?? "GET";
@@ -148,13 +202,27 @@ async function forwardSigned(auth, opts, input, init) {
     const value = headers.get(name);
     if (value !== null) signable[name] = value;
   }
-  const signed = signRequest({ method, url, headers: signable, body }, auth.accessKey, auth.secretKey);
-  for (const [key, value] of Object.entries(signed)) {
-    if (key.toLowerCase() === "host") continue;
-    headers.set(key, String(value));
+
+  // 并发冲突是瞬时的：退避重试通常就能挤进去，不用把失败甩给用户
+  const attempts = Math.max(1, Number(opts?.concurrencyRetries ?? 3));
+  const delayMs = Math.max(0, Number(opts?.concurrencyRetryDelayMs ?? 500));
+  const canReplay = typeof rawBody === "string" || rawBody instanceof Uint8Array || rawBody instanceof ArrayBuffer;
+
+  let response;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const signed = signRequest({ method, url, headers: signable, body }, auth.accessKey, auth.secretKey);
+    for (const [key, value] of Object.entries(signed)) {
+      if (key.toLowerCase() === "host") continue;
+      headers.set(key, String(value));
+    }
+    response = await fetch(input, { ...init, headers });
+    if (!canReplay || attempt === attempts) break;
+    if (!(await isSessionLimit(response))) break;
+    await sleep(delayMs * attempt + Math.floor(Math.random() * 200), init?.signal);
   }
 
-  const response = await fetch(input, { ...init, headers });
+  // 退避重试用尽仍然是并发上限：把原因和该怎么做写进错误信息
+  if (await isSessionLimit(response)) return annotateSessionLimit(response, attempts);
 
   // STS 还没到期就 401/403：多半问题不在登录本身，别让 magpie 因此把账号标记成需要重新登录。
   const expires = Number(auth.expires);
@@ -771,7 +839,14 @@ async function resolveCheckin(auth, options = {}, directory, { force = false } =
 export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
   // magpie 会把插件函数第二个参数（plugins.json 里这一项的 options）传进来；
   // 拿不到时回落到配置文件，最后用默认值。
-  const defaults = { channel: "benefit", maasType: "", autoCheckin: true, account: "" };
+  const defaults = {
+    channel: "benefit",
+    maasType: "",
+    autoCheckin: true,
+    account: "",
+    concurrencyRetries: 3,
+    concurrencyRetryDelayMs: 500,
+  };
   const options = { ...defaults };
   let optionsLoaded = false;
   const getOptions = async () => {
