@@ -47,7 +47,7 @@
       "autoCheckin": true,
       "account": "",
       "concurrencyRetries": 3,
-      "concurrencyRetryDelayMs": 500
+      "concurrencyRetryDelayMs": 800
     }
   }
 }

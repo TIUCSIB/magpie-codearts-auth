@@ -67,6 +67,10 @@ node tools/probe-login.mjs
 | opengw 的 `balance`、`benefit/claim` 对本账号返回 `error_code 4000 invalid channel, group not found`；`benefit/education-gateway-config` 的 `enabled=false` | 同上；所以这两条路径只在渠道开通后才有意义，插件不当成错误 |
 | **推理 401 `verify ak sk signature fail` 的根因**：把调用方传来的头（含 `authorization: Bearer`）全部纳入签名，随后 `authorization` 又被签名值覆盖，服务端按实际请求头验签必然失败 | `tools/repro-401.mjs`：全量头 → 401；白名单头 → 200。修复后 `tools/verify-forward.mjs` 在带 `authorization`/`accept`/`accept-encoding` 的真实形态下稳定 200 |
 | `maas_type=benefit` 在本账号会得到 `4004 benefit not found` | `tools/diagnose-inferhub.mjs`；所以默认不发送该头 |
+| 并发上限 `TM.00001041` 是**服务端按账号**记的活跃会话，插件无法查询或释放 | kernel 日志只暴露 `wss://snap-access.cn-north-4.myhuaweicloud.com/tunnel/ws?clientId=codearts-agent-<机器名>-<随机>` 与 `/snap-manager/v1/chat-session/heartbeat`；后者在现网所有方法都返回 404（未发布），也没有会话列表/关闭接口。`tools/probe-session.mjs`、`tools/probe-session-id.mjs` |
+| 每次启动 CodeArts 客户端都会注册一条新 `clientId` 的隧道 | 两段 kernel 日志：`…-f8bdf0eb`（10:19）与 `…-51295932`（12:49），`clientName: DESKTOP-NTP8TMI` |
+| 该限制是间歇性的：空闲时连续 8 次请求全部 200 | `tools/probe-session-id.mjs`（含带 `x-snap-client-id` / `clientId` / body `session_id` 等变体，无一被拒，说明服务端不按这些字段归并会话） |
+| 插件默认并发 4 高于服务端上限 3，已降为 2；并对 `TM.00001041` 退避重试 | `package.json` 的 `magpie.maxConcurrency`、`index.mjs` 的 `forwardSigned`；`tools/verify-concurrency.mjs` 实测 4 并发全部 200 |
 
 验证结果（本次）：
 

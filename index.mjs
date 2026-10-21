@@ -145,8 +145,9 @@ async function isSessionLimit(response) {
 async function annotateSessionLimit(response, attempts) {
   const text = await response.text();
   const hint =
-    `（magpie 已经重试 ${attempts} 次仍未拿到名额。CodeArts 限制同时进行的会话数为 3：` +
-    `请在 CodeArts 客户端里关闭一些对话，或把 magpie 里这个账号的「并发」调到 2 及以下。）`;
+    `（magpie 已重试 ${attempts} 次。CodeArts 按账号限制同时活跃的会话数为 3，` +
+    `名额由服务端自己回收，客户端每次启动也会占一个；请稍等几分钟重试，` +
+    `并把 magpie 里这个账号的「并发」设在 2 以下、不要同时开着多个对话。）`;
   let payload;
   try {
     payload = JSON.parse(text);
@@ -205,7 +206,7 @@ async function forwardSigned(auth, opts, input, init) {
 
   // 并发冲突是瞬时的：退避重试通常就能挤进去，不用把失败甩给用户
   const attempts = Math.max(1, Number(opts?.concurrencyRetries ?? 3));
-  const delayMs = Math.max(0, Number(opts?.concurrencyRetryDelayMs ?? 500));
+  const delayMs = Math.max(0, Number(opts?.concurrencyRetryDelayMs ?? 800));
   const canReplay = typeof rawBody === "string" || rawBody instanceof Uint8Array || rawBody instanceof ArrayBuffer;
 
   let response;
@@ -845,7 +846,7 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
     autoCheckin: true,
     account: "",
     concurrencyRetries: 3,
-    concurrencyRetryDelayMs: 500,
+    concurrencyRetryDelayMs: 800,
   };
   const options = { ...defaults };
   let optionsLoaded = false;
