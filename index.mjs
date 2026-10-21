@@ -98,6 +98,95 @@ function signRequest({ method, url, headers = {}, body = "" }, accessKey, secret
   };
 }
 
+// 只有这些头参与签名。别的头（accept、accept-encoding、user-agent、authorization…）
+// 由传输层/框架自己处理，一旦纳入签名就会在发送时被改写，导致服务端验签失败
+// （APIG 会回 401 "verify ak sk signature fail"）。
+const SIGNED_HEADERS = [
+  "content-type",
+  "x-security-token",
+  "x-language",
+  "plugin-name",
+  "plugin-version",
+  "x-ot-client-type",
+  "x-ot-client-version",
+  "maas_type",
+  "agent-type",
+];
+
+/** 把 AI SDK 的请求签名后转发到 inferhub。 */
+async function forwardSigned(auth, opts, input, init) {
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  const method = init?.method ?? "GET";
+  const rawBody = init?.body;
+  let body = "";
+  if (typeof rawBody === "string") {
+    body = rawBody;
+  } else if (rawBody instanceof Uint8Array) {
+    body = Buffer.from(rawBody).toString("utf8");
+  } else if (rawBody instanceof ArrayBuffer) {
+    body = Buffer.from(new Uint8Array(rawBody)).toString("utf8");
+  }
+
+  const headers = new Headers(init?.headers);
+  // 这两个头会改变 APIG 的鉴权判定，必须由我们接管
+  headers.delete("authorization");
+  headers.delete("x-auth-token");
+  headers.delete("host");
+  headers.delete("content-length");
+  if (!headers.has("content-type")) headers.set("content-type", "application/json");
+  headers.set("x-security-token", auth.securityToken);
+  headers.set("x-language", "zh-cn");
+  headers.set("plugin-name", PLUGIN_NAME);
+  headers.set("plugin-version", PLUGIN_VERSION);
+  headers.set("x-ot-client-type", "opencode-codearts-auth");
+  headers.set("x-ot-client-version", "0.1.0");
+  if (opts?.maasType) headers.set("maas_type", opts.maasType);
+  else headers.delete("maas_type");
+
+  const signable = {};
+  for (const name of SIGNED_HEADERS) {
+    const value = headers.get(name);
+    if (value !== null) signable[name] = value;
+  }
+  const signed = signRequest({ method, url, headers: signable, body }, auth.accessKey, auth.secretKey);
+  for (const [key, value] of Object.entries(signed)) {
+    if (key.toLowerCase() === "host") continue;
+    headers.set(key, String(value));
+  }
+
+  const response = await fetch(input, { ...init, headers });
+
+  // STS 还没到期就 401/403：多半问题不在登录本身，别让 magpie 因此把账号标记成需要重新登录。
+  const expires = Number(auth.expires);
+  if (
+    (response.status === 401 || response.status === 403) &&
+    Number.isFinite(expires) &&
+    Date.now() < expires - 60_000
+  ) {
+    const patched = new Headers(response.headers);
+    patched.set("X-Magpie-Sign-In", "kept");
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: patched,
+    });
+  }
+  return response;
+}
+
+/**
+ * 额度接口的错误分类：只有明确的鉴权失败才让 magpie 标记账号需要重新登录，
+ * 其他错误（网络、5xx）转成中性文案，避免一次抖动就把账号标成失效。
+ */
+function describeQuotaError(label, error) {
+  const message = String(error?.message ?? error);
+  if (/401|403|unauthorized|forbidden|invalid_grant|APIG\.0301/i.test(message)) {
+    return { text: "CodeArts 凭据已失效，需要重新登录该账号", signIn: "expired" };
+  }
+  const sanitized = message.replace(/\b(401|403|unauthorized|forbidden)\b/gi, "接口错误");
+  return { text: `${label}接口暂时不可用：${sanitized}`.slice(0, 300) };
+}
+
 /** 带 STS 凭据签名的一次调用。 */
 async function signedFetch(auth, { method = "GET", url, body, extraHeaders = {}, signal }) {
   const payload = body === undefined ? "" : body;
@@ -271,8 +360,18 @@ async function refreshAccessToken({ refreshToken, codeVerifier, dpopKeyPair }) {
   });
   const data = await res.json().catch(() => undefined);
   if (!res.ok) {
-    const message = data?.error?.message || data?.error_description || `HTTP ${res.status}`;
-    throw Object.assign(new Error(`CodeArts token refresh failed: ${message}`), { signIn: "expired" });
+    const code = String(data?.error?.code ?? data?.error ?? data?.error_code ?? "");
+    const message = data?.error?.message || data?.error_description || data?.error_msg || `HTTP ${res.status}`;
+    // 只有明确的「刷新令牌失效」才让 magpie 把账号标记成需要重新登录；
+    // 网络/5xx 之类交给 magpie 之后重试，避免一次抖动就要求用户重新登录。
+    const expired =
+      res.status === 400 ||
+      res.status === 401 ||
+      res.status === 403 ||
+      /invalid_grant|expired|unauthorized/i.test(`${code} ${message}`);
+    const error = new Error(`CodeArts token refresh failed: ${message}`);
+    if (expired) error.signIn = "expired";
+    throw error;
   }
   return data;
 }
@@ -315,63 +414,118 @@ const num = (value) => {
   return Number.isFinite(n) ? n : undefined;
 };
 
-/** 余额：GET {benefit}/api/v1/user/tokens/balance */
-async function fetchBalance(auth, channel) {
-  const base = `${BENEFIT_API}/api/v1/user/tokens/balance`;
-  const url = channel ? `${base}?channel=${encodeURIComponent(channel)}` : base;
-  const res = await signedFetch(auth, { method: "GET", url, signal: undefined });
-  if (res.data?.error_code && res.data.error_code !== "0000") {
-    return { error: `余额接口返回 error_code=${res.data.error_code}` };
-  }
-  const result = res.data?.result ?? res.data;
-  const tokens = firstOf(num(result?.available_tokens), num(result?.remain_tokens), num(result?.balance), num(result?.tokens), num(result?.total));
-  return { raw: result, tokens };
-}
-
-/** 套餐概览：GET {snap}/snap-manager/v1/package/overview —— 「余额/额度」的主来源。 */
-async function fetchPackageOverview(auth) {
-  const url = `${SNAP_ENGINE}/snap-manager/v1/package/overview`;
-  const res = await signedFetch(auth, { method: "GET", url, extraHeaders: {} });
+/**
+ * 额度 / 积分：GET {snap}/snap-manager/v1/statistics/plugin
+ * metrics[] 里的 package_credit_* 是「余额提醒」的真正来源
+ * （客户端的 /snap-manager/v1/package/overview 在现网返回 404 APIG.0101）。
+ */
+async function fetchQuotaStats(auth) {
+  const url = `${SNAP_ENGINE}/snap-manager/v1/statistics/plugin`;
+  const res = await signedFetch(auth, { method: "GET", url });
   return res.data;
 }
 
-function packageWindows(overview) {
-  const metrics = Array.isArray(overview?.metrics) ? overview.metrics : [];
+const QUOTA_WINDOW_LABELS = {
+  usageTotalPackageCredit: "积分总额",
+  usageBasicPackageCredit: "基础套餐积分",
+  usageBonusPackageCredit: "赠送积分",
+  usageOnDemandPackageCredit: "按需积分",
+  usageTokenChatMessages: "对话 tokens",
+  usageDataChatMessages: "对话次数",
+};
+
+function packageWindows(stats) {
+  const metrics = Array.isArray(stats?.metrics) ? stats.metrics : [];
   const windows = [];
   for (const metric of metrics) {
-    const name = metric?.name;
-    if (!name) continue;
-    if (metric.show === false) continue;
+    const key = metric?.name;
+    if (!key || metric.show === false) continue;
     const used = num(metric.package_credit_used);
     const amount = num(metric.package_credit_amount);
     const remain = num(metric.package_credit_remain);
     const expiring = num(metric.package_credit_expiring_amount);
     const usedTokens = num(metric.usage_token_num);
     const tokenAmount = num(metric.package_token_amount);
-    const isUnlimited = usedTokens === -1 || tokenAmount === -1;
-    const display = isUnlimited
+    const isCredits = amount !== undefined && amount > 0;
+    const isTokens = !isCredits && tokenAmount !== undefined && tokenAmount > 0;
+    // 明显不成比例的 tokens 窗口（例如 package_token_amount 是 1 却用了 1300 万 token）
+    // 说明这个字段不是额度，跳过它，别在界面上给出误导数字
+    if (isTokens && usedTokens !== undefined && usedTokens > tokenAmount * 10) continue;
+    // 全是 0 的窗口没有信息量（例如未开通的按需计费），不往界面上堆
+    if (!isCredits && !isTokens && usedTokens !== -1) continue;
+    const unlimited = usedTokens === -1 || tokenAmount === -1;
+    const display = unlimited
       ? "不限量"
-      : amount !== undefined
-        ? `${used ?? 0} / ${amount} credits（剩余 ${remain ?? amount - (used ?? 0)}${expiring ? `，${expiring} 即将过期` : ""}）`
-        : tokenAmount !== undefined
-          ? `${usedTokens ?? 0} / ${tokenAmount} tokens`
-          : undefined;
-    const percent = amount && amount > 0 && used !== undefined
-      ? (used * 100) / amount
-      : tokenAmount && tokenAmount > 0 && usedTokens !== undefined
-        ? (usedTokens * 100) / tokenAmount
-        : undefined;
+      : isCredits
+        ? `已用 ${used ?? 0} / ${amount} 积分，剩 ${remain ?? Math.max(0, amount - (used ?? 0))}${expiring ? `（${expiring} 即将过期）` : ""}`
+        : `已用 ${usedTokens ?? 0} / ${tokenAmount} tokens`;
     windows.push({
-      name,
-      used: percent,
-      amount: amount ?? usedTokens,
-      limit: amount ?? tokenAmount,
-      unit: amount !== undefined ? "credits" : "tokens",
+      name: QUOTA_WINDOW_LABELS[key] ?? key,
+      used: isCredits
+        ? used !== undefined
+          ? (used * 100) / amount
+          : undefined
+        : isTokens && usedTokens !== undefined
+          ? (usedTokens * 100) / tokenAmount
+          : undefined,
+      amount: isCredits ? amount : tokenAmount,
+      limit: isCredits ? amount : tokenAmount,
+      unit: isCredits ? "credits" : "tokens",
       display,
-      aside: metric.show === false,
+      ...(key === "usageTotalPackageCredit" ? { span: 30 * 24 * 3600 } : {}),
     });
   }
   return windows;
+}
+
+/** 剩余积分（auth.usage 的 balance）。 */
+function creditsFromStats(stats) {
+  const metrics = Array.isArray(stats?.metrics) ? stats.metrics : [];
+  const total = metrics.find((metric) => metric?.name === "usageTotalPackageCredit");
+  return {
+    remain: num(total?.package_credit_remain),
+    amount: num(total?.package_credit_amount),
+    used: num(total?.package_credit_used),
+  };
+}
+
+/** 账号可用的模型：statistics/plugin 的 model_metrics。 */
+function modelsFromStats(stats) {
+  const models = Array.isArray(stats?.model_metrics) ? stats.model_metrics : [];
+  return models
+    .filter((model) => model?.model_id && model.enable !== false)
+    .map((model) => ({
+      id: model.model_id,
+      name: model.model_name || model.model_id,
+      description: model.model_desc,
+      quota: num(model.model_quota_num),
+      luxury: Boolean(model.is_luxury),
+    }));
+}
+
+/** 权益渠道余额：GET {benefit}/api/v1/user/tokens/balance（渠道未开通时返回 error_code 4000）。 */
+async function fetchBalance(auth, channel) {
+  const base = `${BENEFIT_API}/api/v1/user/tokens/balance`;
+  const url = channel ? `${base}?channel=${encodeURIComponent(channel)}` : base;
+  const res = await signedFetch(auth, { method: "GET", url });
+  const data = res.data;
+  if (data?.error_code && data.error_code !== "0000") {
+    return {
+      notEnabled: data.error_code === "4000",
+      error: data.error_code === "4000"
+        ? `权益渠道未开通（${data.error_msg ?? "invalid channel"}）`
+        : `余额接口返回 error_code=${data.error_code}`,
+    };
+  }
+  const result = data?.result ?? data;
+  const tokens = firstOf(
+    num(result?.available_tokens),
+    num(result?.remain_tokens),
+    num(result?.balance),
+    num(result?.tokens),
+    num(result?.total),
+  );
+  return { raw: result, tokens };
 }
 
 /** 权益渠道开关：GET {policyCenter}/v1/{benefit|education}-gateway-config */
@@ -437,16 +591,15 @@ async function fetchBuiltinModels(auth) {
     .filter((m) => m.id);
 }
 
-/** 签到 / 领取权益：POST {benefit}/api/v1/benefit/claim[?channel=…] */
+/** 权益渠道领取：POST {benefit}/api/v1/benefit/claim[?channel=…]（渠道开通时才有意义） */
 async function claimBenefit(auth, channel) {
   const base = `${BENEFIT_API}/api/v1/benefit/claim`;
   const url = channel ? `${base}?channel=${encodeURIComponent(channel)}` : base;
   const res = await signedFetch(auth, { method: "POST", url, body: "{}" });
   const data = res.data;
   const code = data?.error_code;
-  const ok = code === "0000" || code === undefined || code === 0;
   return {
-    ok,
+    ok: code === "0000" || code === undefined || code === 0,
     errorCode: code,
     message: data?.error_msg || data?.message,
     result: data?.result,
@@ -463,7 +616,94 @@ async function fetchWelfareDelivery(auth) {
   });
   const data = res.data;
   const ok = data?.code === 0 || data?.code === 200 || data?.data !== undefined || data?.success === true;
-  return { ok, data: data?.data ?? data };
+  return { ok, items: Array.isArray(data?.data?.items) ? data.data.items : [], raw: data };
+}
+
+/** 每日签到的活动：优先 USER_LOGIN 类型，其次标题里带「签到」，最后退到任意可领活动。 */
+function pickCheckinCampaign(items) {
+  const list = Array.isArray(items) ? items : [];
+  const claimable = list.filter((item) => item?.claimable === true);
+  return (
+    claimable.find((item) => String(item?.type ?? "").toUpperCase() === "USER_LOGIN") ??
+    claimable.find((item) => /签到|登录/.test(`${item?.title ?? ""}${item?.type ?? ""}`)) ??
+    claimable[0]
+  );
+}
+
+/** 领取福利：POST {policyCenter}/v1/ops/claim */
+async function claimWelfare(auth, campaignId, idempotentKey = crypto.randomUUID()) {
+  const url = `${SNAP_ENGINE}/v1/ops/claim`;
+  const body = JSON.stringify({ campaignId, idempotentKey, channel: "DESKTOP" });
+  const res = await signedFetch(auth, { method: "POST", url, body });
+  const data = res.data;
+  const payload = data?.data ?? data?.result;
+  return {
+    ok: data?.code === 0 || data?.code === 200 || payload !== undefined,
+    message: data?.message,
+    userBenefitId: payload?.userBenefitId ?? payload?.user_benefit_id ?? payload?.id,
+    data: payload,
+  };
+}
+
+/** 确认到账：POST {policyCenter}/v1/ops/confirm */
+async function confirmWelfare(auth, userBenefitId) {
+  const url = `${SNAP_ENGINE}/v1/ops/confirm`;
+  const body = JSON.stringify({ userBenefitId });
+  const res = await signedFetch(auth, { method: "POST", url, body });
+  const data = res.data;
+  return {
+    ok: data?.code === 0 || data?.code === 200 || data?.data !== undefined,
+    message: data?.message,
+    data: data?.data,
+  };
+}
+
+/** 没有可领活动时的结论：签到活动还在但不可领 = 今天已经签过了。 */
+function noClaimableCheckin(items) {
+  const list = Array.isArray(items) ? items : [];
+  const loginCampaign = list.find((item) => String(item?.type ?? "").toUpperCase() === "USER_LOGIN");
+  if (loginCampaign) {
+    return {
+      status: "already",
+      message: loginCampaign.status ? `今日已签到（${loginCampaign.status}）` : "今日已签到",
+      campaign: loginCampaign,
+    };
+  }
+  return { status: "none", message: "当前没有可领取的签到活动", items: list };
+}
+
+/**
+ * 每日签到一条龙：delivery 找可领的 USER_LOGIN 活动 → claim → confirm。
+ * 这是 CodeArts 客户端「每日签到领 1000 积分」走的那条链路。
+ */
+async function runCheckin(auth) {
+  const delivery = await fetchWelfareDelivery(auth);
+  if (!delivery.ok) {
+    return { status: "unavailable", message: "福利接口不可用（登录可能已失效）" };
+  }
+  const campaign = pickCheckinCampaign(delivery.items);
+  if (!campaign) return noClaimableCheckin(delivery.items);
+  const claim = await claimWelfare(auth, campaign.campaignId);
+  if (!claim.ok) {
+    return { status: "failed", message: claim.message ?? "领取失败", campaign, claim };
+  }
+  let confirmed;
+  if (claim.userBenefitId !== undefined && claim.userBenefitId !== null) {
+    confirmed = await confirmWelfare(auth, claim.userBenefitId);
+  }
+  return { status: "claimed", campaign, claim, confirmed };
+}
+
+/** 把福利活动列表转成给人看的几行。 */
+function describeCampaigns(items) {
+  const list = Array.isArray(items) ? items : [];
+  if (list.length === 0) return "（福利中心没有返回活动）";
+  return list
+    .map((item) => {
+      const state = item.claimable ? "可领取" : String(item.status ?? "未参与");
+      return `· #${item.campaignId} ${item.title ?? item.type ?? ""} +${item.benefitAmount ?? "?"} ${item.benefitUnit ?? ""}（${state}）`;
+    })
+    .join("\n");
 }
 
 // ─── 签到状态（按天一次）────────────────────────────────────────────────────────
@@ -669,6 +909,7 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
             baseURL: INFERHUB_BASE,
             async fetch(input, init) {
               const headers = new Headers(init?.headers);
+              headers.delete("authorization");
               headers.set("x-auth-token", auth.key);
               if (opts.maasType) headers.set("maas_type", opts.maasType);
               headers.set("x-ot-client-type", "opencode-codearts-auth");
@@ -682,36 +923,7 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
         return {
           baseURL: INFERHUB_BASE,
           async fetch(input, init) {
-            const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-            const method = init?.method ?? "GET";
-            const rawBody = init?.body;
-            let body = "";
-            if (typeof rawBody === "string") {
-              body = rawBody;
-            } else if (rawBody instanceof Uint8Array || rawBody instanceof ArrayBuffer) {
-              body = Buffer.from(rawBody).toString("utf8");
-            }
-            const headers = new Headers(init?.headers);
-            headers.set("x-ot-client-type", "opencode-codearts-auth");
-            headers.set("x-ot-client-version", "0.1.0");
-            headers.set("plugin-name", PLUGIN_NAME);
-            headers.set("plugin-version", PLUGIN_VERSION);
-            if (opts.maasType) headers.set("maas_type", opts.maasType);
-            const signed = signRequest(
-              {
-                method,
-                url,
-                headers: Object.fromEntries(headers.entries()),
-                body,
-              },
-              auth.accessKey,
-              auth.secretKey,
-            );
-            for (const [key, value] of Object.entries(signed)) {
-              if (key.toLowerCase() === "host") continue;
-              headers.set(key, String(value));
-            }
-            return fetch(input, { ...init, headers });
+            return forwardSigned(auth, opts, input, init);
           },
         };
       },
@@ -719,69 +931,72 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
       /** 余额提醒：magpie 的账号额度窗口 / magpie quota / GET /v1/magpie/quotas。 */
       async usage(getAuth) {
         const auth = await accountOf(getAuth);
-        if (!auth?.accessKey) return { windows: [], error: "请先登录 CodeArts" };
+        if (!auth?.accessKey) return { windows: [], error: "CodeArts 账号尚未授权" };
         const opts = await getOptions();
         const result = { windows: [] };
         let failed = false;
 
         try {
-          const overview = await fetchPackageOverview(auth);
-          if (overview) {
-            const pkg = overview.package ?? {};
-            result.plan = pkg.package_name_cn || pkg.package_name_en || undefined;
-            result.until = overview.end_date || undefined;
-            result.windows.push(...packageWindows(overview));
-            const onDemand = (overview.model_package ?? []).reduce(
-              (sum, item) => sum + (num(item?.package_user_used_token) ?? 0),
-              0,
-            );
-            if (onDemand > 0) {
-              result.windows.push({
-                name: "按需用量",
-                amount: onDemand,
-                unit: "tokens",
-                display: `${onDemand} tokens（按量计费部分）`,
-              });
-            }
+          const stats = await fetchQuotaStats(auth);
+          result.windows.push(...packageWindows(stats));
+          const credits = creditsFromStats(stats);
+          if (credits.remain !== undefined) {
+            result.balance = `${credits.remain} 积分（共 ${credits.amount ?? "?"}，已用 ${credits.used ?? 0}）`;
           }
+          const models = modelsFromStats(stats);
+          if (models.length > 0) result.plan = result.plan ?? `CodeArts · ${models.length} 个可用模型`;
         } catch (error) {
           failed = true;
-          result.error = `套餐概览读取失败：${String(error?.message ?? error)}`;
+          const described = describeQuotaError("额度", error);
+          if (!result.error) result.error = described.text;
+          if (described.signIn) result.signIn = described.signIn;
         }
 
+        // 权益渠道余额：渠道没开通时（error_code 4000）不当成错误，它只是没这个渠道
         try {
           const balance = await fetchBalance(auth, opts.channel);
-          if (balance.error) {
+          if (balance.error && !balance.notEnabled) {
             if (!result.error) result.error = balance.error;
           } else if (balance.tokens !== undefined) {
-            result.balance = `${balance.tokens} tokens`;
+            result.balance = `${balance.tokens} tokens（${opts.channel ?? "benefit"} 渠道）`;
           }
         } catch (error) {
-          failed = true;
-          if (!result.error) result.error = `余额读取失败：${String(error?.message ?? error)}`;
+          const described = describeQuotaError("余额", error);
+          if (described.signIn) {
+            failed = true;
+            if (!result.error) result.error = described.text;
+            result.signIn = described.signIn;
+          }
         }
 
         // 可选：让 magpie 的定期额度刷新顺带完成当天签到
         if (opts.autoCheckin) {
           const state = readCheckinState(directory);
           if (state.lastCheckin !== today()) {
+            state.lastCheckin = today();
             try {
-              const claimed = await claimBenefit(auth, opts.channel);
-              state.lastCheckin = today();
-              state.lastResult = claimed.ok ? "ok" : String(claimed.errorCode ?? claimed.message ?? "failed");
-              writeCheckinState(directory, state);
-              if (claimed.ok) {
-                result.windows.push({ name: "今日签到", display: "已领取权益 ✅" });
+              const checkin = await runCheckin(auth);
+              state.lastResult = checkin.status;
+              state.lastMessage = checkin.message;
+              if (checkin.status === "claimed") {
+                state.lastCredit = checkin.campaign?.benefitAmount;
+              }
+              if (checkin.status === "claimed") {
+                result.windows.push({
+                  name: "今日签到",
+                  display: `已领取 +${checkin.campaign?.benefitAmount ?? "?"} 积分`,
+                });
+              } else if (checkin.status === "already") {
+                result.windows.push({ name: "今日签到", display: "今日已签到" });
               }
             } catch (error) {
-              state.lastCheckin = today();
-              state.lastResult = String(error?.message ?? error);
-              writeCheckinState(directory, state);
+              state.lastResult = "error";
+              state.lastMessage = String(error?.message ?? error);
             }
+            writeCheckinState(directory, state);
           }
         }
 
-        if (failed && result.windows.length === 0) return result;
         return result;
       },
     },
@@ -792,10 +1007,29 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
       async models(provider, { auth } = {}) {
         if (auth?.type !== "oauth" || !auth?.accessKey) return provider.models;
         let found = [];
+        // 账号侧的权威列表（带启用状态）：statistics/plugin 的 model_metrics
         try {
-          found = await fetchBuiltinModels(auth);
+          found = modelsFromStats(await fetchQuotaStats(auth));
         } catch {
           found = [];
+        }
+        // 用 agent-center 的细节补上下文长度与多模态
+        try {
+          const detailed = await fetchBuiltinModels(auth);
+          const byId = new Map(found.map((model) => [model.id, model]));
+          for (const model of detailed) {
+            const existing = byId.get(model.id);
+            if (existing) {
+              existing.context = existing.context ?? model.context;
+              existing.output = existing.output ?? model.output;
+              existing.image = existing.image ?? model.image;
+              existing.reasoning = existing.reasoning ?? model.reasoning;
+            } else {
+              found.push(model);
+            }
+          }
+        } catch {
+          /* 细节拿不到就用账号列表 */
         }
         try {
           if (await fetchGatewayEnabled(auth, "benefit")) {
@@ -805,7 +1039,7 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
             found = [...found, ...(await fetchChannelModels(auth, "education"))];
           }
         } catch {
-          /* 权益渠道不可用时只用内置模型 */
+          /* 权益渠道不可用时只用账号列表 */
         }
         if (found.length === 0) return provider.models;
         const template = Object.values(provider.models)[0] ?? {};
@@ -847,7 +1081,7 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
     /** 签到相关工具，经 magpie 的内置 MCP（/mcp/magpie/tools）给任意 agent。 */
     tool: {
       checkin: {
-        description: "CodeArts 每日签到：领取当日免费权益/额度，并返回当前余额。",
+        description: "CodeArts 每日签到：领取「每日签到」活动积分（走 delivery → claim → confirm），并回读积分余额。",
         args: {
           type: "object",
           properties: {
@@ -860,28 +1094,42 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
           if (!auth?.accessKey) return "未登录 CodeArts，请先在 magpie 里登录该供应商。";
           const opts = await getOptions();
           const channel = args.channel || opts.channel;
-          const claimed = await claimBenefit(auth, channel);
+          const result = await runCheckin(auth);
           const state = readCheckinState(directory);
           state.lastCheckin = today();
-          state.lastResult = claimed.ok ? "ok" : String(claimed.errorCode ?? claimed.message ?? "failed");
+          state.lastResult = result.status;
+          state.lastMessage = result.message;
+          if (result.campaign?.benefitAmount) state.lastCredit = result.campaign.benefitAmount;
           writeCheckinState(directory, state);
-          const lines = [
-            claimed.ok
-              ? `✅ 签到成功${claimed.result ? `：${JSON.stringify(claimed.result)}` : ""}`
-              : `⚠️ 签到未成功：error_code=${claimed.errorCode ?? "unknown"}${claimed.message ? ` ${claimed.message}` : ""}`,
-          ];
-          try {
-            const balance = await fetchBalance(auth, channel);
-            if (balance.tokens !== undefined) lines.push(`当前余额：${balance.tokens} tokens`);
-          } catch {
-            /* 余额读不到就只回签到结果 */
+
+          const lines = [];
+          if (result.status === "claimed") {
+            lines.push(
+              `✅ 签到成功：${result.campaign.title ?? "每日签到"} +${result.campaign.benefitAmount ?? "?"} ${result.campaign.benefitUnit ?? ""}`.trim(),
+            );
+            if (result.confirmed && result.confirmed.ok === false && result.confirmed.message) {
+              lines.push(`（到账确认接口返回：${result.confirmed.message}）`);
+            }
+          } else if (result.status === "already") {
+            lines.push(`今日已签到，明天再来（${result.message}）`);
+          } else if (result.status === "none") {
+            lines.push(`没有可领取的签到活动：${describeCampaigns(result.items ?? [])}`);
+          } else {
+            lines.push(`⚠️ 签到未完成（${result.status}）：${result.message ?? "未知原因"}`);
+            if (result.status === "unavailable" && !opts.channel) {
+              lines.push("如果是登录失效，请在 magpie 里重新登录该账号。");
+            }
           }
-          lines.push(`（渠道：${channel ?? "benefit"}，日期：${today()}）`);
+          const stats = await fetchQuotaStats(auth).catch(() => undefined);
+          const credits = creditsFromStats(stats);
+          if (credits.remain !== undefined) {
+            lines.push(`当前积分：${credits.remain} / ${credits.amount ?? "?"}（已用 ${credits.used ?? 0}）`);
+          }
           return lines.join("\n");
         },
       },
       balance: {
-        description: "查询 CodeArts 账号余额、套餐额度与到期时间。",
+        description: "查询 CodeArts 账号积分余额、额度窗口与可用模型。",
         args: {
           type: "object",
           properties: {
@@ -896,33 +1144,39 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
           const channel = args.channel || opts.channel;
           const lines = [];
           try {
-            const overview = await fetchPackageOverview(auth);
-            const pkg = overview?.package ?? {};
-            lines.push(`套餐：${pkg.package_name_cn || pkg.package_name_en || "未知"}${overview?.end_date ? `（到期 ${overview.end_date}）` : ""}`);
-            for (const window of packageWindows(overview)) {
-              lines.push(`· ${window.name}：${window.display ?? `${window.used ?? 0}%`}`);
+            const stats = await fetchQuotaStats(auth);
+            const credits = creditsFromStats(stats);
+            if (credits.remain !== undefined) {
+              lines.push(`积分：${credits.remain} / ${credits.amount ?? "?"}（已用 ${credits.used ?? 0}）`);
             }
+            for (const window of packageWindows(stats)) {
+              lines.push(`· ${window.name}：${window.display ?? `${Math.round(window.used ?? 0)}%`}`);
+            }
+            const models = modelsFromStats(stats);
+            if (models.length > 0) lines.push(`可用模型：${models.map((model) => model.name).join(", ")}`);
           } catch (error) {
-            lines.push(`套餐概览读取失败：${String(error?.message ?? error)}`);
+            lines.push(`额度接口读取失败：${String(error?.message ?? error)}`);
           }
           try {
             const balance = await fetchBalance(auth, channel);
-            lines.push(balance.tokens !== undefined ? `余额：${balance.tokens} tokens` : `余额：${balance.error ?? "接口未返回可读字段"}`);
+            if (balance.tokens !== undefined) lines.push(`渠道余额：${balance.tokens} tokens`);
+            else if (balance.notEnabled) lines.push(`渠道余额：${opts.channel ?? "benefit"} 渠道未开通`);
+            else if (balance.error) lines.push(`渠道余额：${balance.error}`);
           } catch (error) {
-            lines.push(`余额读取失败：${String(error?.message ?? error)}`);
+            lines.push(`渠道余额读取失败：${String(error?.message ?? error)}`);
           }
           return lines.join("\n");
         },
       },
       welfare: {
-        description: "查看 CodeArts 福利中心当前可领取的活动（不自动领取）。",
+        description: "查看 CodeArts 福利中心的全部活动（签到/邀请/新人）与领取状态，不自动领取。",
         args: { type: "object", properties: {}, additionalProperties: false },
         async execute(_args, ctx) {
           const auth = await resolveAccount();
           if (!auth?.accessKey) return "未登录 CodeArts，请先在 magpie 里登录该供应商。";
           const delivery = await fetchWelfareDelivery(auth);
-          if (!delivery.ok) return `福利接口返回异常：${JSON.stringify(delivery.data).slice(0, 400)}`;
-          return `福利活动：${JSON.stringify(delivery.data).slice(0, 1500)}`;
+          if (!delivery.ok) return `福利接口返回异常：${JSON.stringify(delivery.raw).slice(0, 400)}`;
+          return describeCampaigns(delivery.items);
         },
       },
     },
@@ -941,11 +1195,21 @@ export const _internal = {
   canonicalUriOf,
   sdkDate,
   sha256Hex,
+  SIGNED_HEADERS,
+  forwardSigned,
+  describeQuotaError,
   generatePkcePair,
   generateDpopProof,
   generateDpopKeyPair,
   buildAuthorizeUrl,
   sessionFromTokenResponse,
   packageWindows,
+  creditsFromStats,
+  modelsFromStats,
+  fetchQuotaStats,
+  pickCheckinCampaign,
+  noClaimableCheckin,
+  describeCampaigns,
+  runCheckin,
   DEFAULT_MODELS,
 };

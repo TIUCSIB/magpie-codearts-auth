@@ -52,3 +52,25 @@ node tools/probe-login.mjs
 3. **登录链路端到端**（`tools/probe-login.mjs`）：`authorize()` 产出的 URL 与客户端一致；本地回调
    服务器收到回调返回 200；`callback()` 带 DPoP 打到华为云 STS（假授权码 → HTTP 400，说明请求结构
    与 DPoP 被接受，而不是签名/格式错误）。
+
+## 真实账号上的运行时代验证
+
+用本机 magpie 保存的 CodeArts 账号（`tools/verify-forward.mjs`、`tools/inspect-quota.mjs`、
+`tools/inspect-welfare.mjs`）跑出来的事实，修正/确认了静态分析的几处：
+
+| 事实 | 依据 |
+| --- | --- |
+| **额度来源是 `snap-manager/v1/statistics/plugin`**，`package/overview` 现网 404（`APIG.0101`） | `tools/inspect-quota.mjs`；`metrics[]` 给出 `package_credit_amount/used/remain`（15500 / 974.89 / 14525.11） |
+| 模型列表来源是同一响应的 `model_metrics[]` | 8 个可用模型（GLM-5.2、Qwen3-VL-235B、kimi-k2.6-vl、openpangu-2.0-flash/pro、glm-5.3、glm-5.2-sft-harmony、deepseek-v4.1-flash） |
+| **每日签到是 `USER_LOGIN` campaign，走 `delivery → claim → confirm`** | `tools/inspect-welfare.mjs`：#1「每日签到领1000积分」`claimable=true` → 领取后 `status=CLAIMED`、积分 14525.11 → **15525.11**（总额度 15500 → 16500） |
+| 福利活动共 4 个（新人 4000 / 邀请 1000 / 学生认证 4000 / 每日签到 1000） | 同上 |
+| opengw 的 `balance`、`benefit/claim` 对本账号返回 `error_code 4000 invalid channel, group not found`；`benefit/education-gateway-config` 的 `enabled=false` | 同上；所以这两条路径只在渠道开通后才有意义，插件不当成错误 |
+| **推理 401 `verify ak sk signature fail` 的根因**：把调用方传来的头（含 `authorization: Bearer`）全部纳入签名，随后 `authorization` 又被签名值覆盖，服务端按实际请求头验签必然失败 | `tools/repro-401.mjs`：全量头 → 401；白名单头 → 200。修复后 `tools/verify-forward.mjs` 在带 `authorization`/`accept`/`accept-encoding` 的真实形态下稳定 200 |
+| `maas_type=benefit` 在本账号会得到 `4004 benefit not found` | `tools/diagnose-inferhub.mjs`；所以默认不发送该头 |
+
+验证结果（本次）：
+
+- `bun test` → **29 pass / 0 fail**；
+- 转发：`POST /api/v2/chat/completions` → 200（GLM-5.1 正常回包）；
+- 额度：`auth.usage` 输出 15525.11 / 16500 积分与 3 个有效窗口（总额/基础/赠送）；
+- 签到：真实领取成功（+1000 积分），重复调用返回「今日已签到（CLAIMED）」。

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import crypto from "node:crypto";
-import { _internal } from "../index.mjs";
+import { CodeArtsAuthPlugin, _internal } from "../index.mjs";
 
 const {
   signRequest,
@@ -175,36 +175,113 @@ describe("登录 URL 与账号字段", () => {
 });
 
 describe("额度窗口解析", () => {
-  test("把 package overview 的 metrics 变成 magpie 窗口", () => {
+  test("把 statistics/plugin 的 metrics 变成 magpie 窗口", () => {
     const windows = packageWindows({
       metrics: [
         {
-          name: "usageToken",
+          name: "usageTokenChatMessages",
           show: true,
           usage_token_num: 250,
           package_token_amount: 1000,
         },
         {
-          name: "credit",
+          name: "usageTotalPackageCredit",
           show: true,
-          package_credit_used: 30,
-          package_credit_amount: 100,
-          package_credit_remain: 70,
-          package_credit_expiring_amount: 10,
+          package_credit_used: 974.89,
+          package_credit_amount: 15500,
+          package_credit_remain: 14525.11,
+          package_credit_expiring_amount: 0,
         },
       ],
     });
     expect(windows).toHaveLength(2);
+    expect(windows[0].name).toBe("对话 tokens");
     expect(windows[0].used).toBeCloseTo(25);
+    expect(windows[1].name).toBe("积分总额");
     expect(windows[1].unit).toBe("credits");
-    expect(windows[1].display).toContain("30 / 100 credits");
+    expect(windows[1].used).toBeCloseTo(6.2897, 3);
+    expect(windows[1].display).toContain("974.89 / 15500 积分");
+    expect(windows[1].display).toContain("14525.11");
   });
 
   test("不限量时给出可读文案", () => {
     const [window] = packageWindows({
-      metrics: [{ name: "usageToken", usage_token_num: -1, package_token_amount: -1 }],
+      metrics: [{ name: "usageTokenChatMessages", usage_token_num: -1, package_token_amount: -1 }],
     });
     expect(window.display).toBe("不限量");
+  });
+
+  test("全 0 的窗口（未开通按需计费）不进界面", () => {
+    const windows = packageWindows({
+      metrics: [
+        { name: "usageOnDemandPackageCredit", show: true, package_credit_used: 0, package_credit_amount: 0 },
+        { name: "usageBasicPackageCredit", show: true, package_credit_used: 0, package_credit_amount: 500 },
+      ],
+    });
+    expect(windows).toHaveLength(1);
+    expect(windows[0].name).toBe("基础套餐积分");
+  });
+
+  test("不成比例的 tokens 窗口不显示（package_token_amount 不是额度）", () => {
+    const windows = packageWindows({
+      metrics: [{ name: "usageTokenChatMessages", show: true, usage_token_num: 13645620, package_token_amount: 1 }],
+    });
+    expect(windows).toHaveLength(0);
+  });
+
+  test("剩余积分取总额度窗口", () => {
+    const credits = _internal.creditsFromStats({
+      metrics: [
+        { name: "usageTotalPackageCredit", package_credit_amount: 15500, package_credit_used: 974.89, package_credit_remain: 14525.11 },
+      ],
+    });
+    expect(credits.remain).toBe(14525.11);
+    expect(credits.used).toBe(974.89);
+  });
+});
+
+describe("模型列表与签到活动", () => {
+  test("model_metrics 只保留启用的模型", () => {
+    const models = _internal.modelsFromStats({
+      model_metrics: [
+        { model_id: "GLM-5.2", model_name: "GLM-5.2", model_desc: "旗舰", enable: true },
+        { model_id: "old-model", model_name: "Old", enable: false },
+      ],
+    });
+    expect(models).toHaveLength(1);
+    expect(models[0]).toEqual({ id: "GLM-5.2", name: "GLM-5.2", description: "旗舰", quota: undefined, luxury: false });
+  });
+
+  test("签到优先选 USER_LOGIN 且只挑可领取的活动", () => {
+    const items = [
+      { campaignId: 4, type: "NEW_USER_REGISTER", claimable: false, title: "新用户注册送 4000 积分" },
+      { campaignId: 3, type: "INVITE_USER", claimable: true, title: "推荐码上有礼" },
+      { campaignId: 1, type: "USER_LOGIN", claimable: true, title: "每日签到领1000积分" },
+    ];
+    expect(_internal.pickCheckinCampaign(items).campaignId).toBe(1);
+    expect(_internal.pickCheckinCampaign([items[1]]).campaignId).toBe(3);
+    expect(_internal.pickCheckinCampaign([items[0]])).toBeUndefined();
+    expect(_internal.pickCheckinCampaign([])).toBeUndefined();
+  });
+
+  test("签到活动还在但不可领 = 今天已签到", () => {
+    const result = _internal.noClaimableCheckin([
+      { campaignId: 1, type: "USER_LOGIN", status: "CLAIMED", claimable: false, title: "每日签到领1000积分" },
+    ]);
+    expect(result.status).toBe("already");
+    expect(result.message).toContain("CLAIMED");
+    expect(_internal.noClaimableCheckin([]).status).toBe("none");
+    const none = _internal.noClaimableCheckin([{ campaignId: 3, type: "INVITE_USER", claimable: false }]);
+    expect(none.status).toBe("none");
+  });
+
+  test("活动列表能转成可读文案", () => {
+    const text = _internal.describeCampaigns([
+      { campaignId: 1, type: "USER_LOGIN", title: "每日签到领1000积分", benefitAmount: 1000, benefitUnit: "CREDIT", claimable: true },
+      { campaignId: 4, type: "NEW_USER_REGISTER", title: "新用户注册送 4000 积分", benefitAmount: 4000, benefitUnit: "CREDIT", status: "CONFIRMED" },
+    ]);
+    expect(text).toContain("#1 每日签到领1000积分 +1000 CREDIT（可领取）");
+    expect(text).toContain("#4 新用户注册送 4000 积分 +4000 CREDIT（CONFIRMED）");
   });
 });
 
@@ -223,5 +300,140 @@ describe("供应商常量", () => {
       expect(model.context).toBeGreaterThan(0);
       expect(model.output).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("请求转发（真实故障的回归测试）", () => {
+  // 现场故障：把 AI SDK / magpie 传来的所有头都纳入签名，包括它自己会覆盖掉的
+  // authorization，服务端验签失败 → 401 verify ak sk signature fail → magpie 把账号
+  // 标记成「需要重新登录」。
+  const account = () => ({
+    type: "oauth",
+    accessKey: "AK",
+    secretKey: "SK",
+    securityToken: "ST",
+    expires: Date.now() + 3_600_000,
+  });
+
+  const withStubFetch = async (run) => {
+    const original = globalThis.fetch;
+    const calls = [];
+    globalThis.fetch = async (input, init) => {
+      calls.push({ input, headers: new Headers(init?.headers), body: init?.body });
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    };
+    try {
+      return await run(calls);
+    } finally {
+      globalThis.fetch = original;
+    }
+  };
+
+  const loaderFetch = async (auth = account(), options = {}) => {
+    const hooks = await CodeArtsAuthPlugin({ directory: process.cwd() }, options);
+    const config = await hooks.auth.loader(async () => auth);
+    return config.fetch;
+  };
+
+  test("baseURL 与 model 请求都指向 inferhub", async () => {
+    const hooks = await CodeArtsAuthPlugin({ directory: process.cwd() }, {});
+    const config = await hooks.auth.loader(async () => account());
+    expect(config.baseURL).toBe(INFERHUB_BASE);
+  });
+
+  test("只把白名单头纳入签名，authorization 由签名接管", async () => {
+    const forward = await loaderFetch();
+    await withStubFetch(async (calls) => {
+      await forward("https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer ",
+          accept: "*/*",
+          "user-agent": "Bun/1.4.3",
+          "accept-encoding": "gzip, deflate",
+        },
+        body: '{"model":"GLM-5.1","messages":[]}',
+      });
+      expect(calls).toHaveLength(1);
+      const { headers } = calls[0];
+      const authorization = headers.get("authorization");
+      expect(authorization).toStartWith("SDK-HMAC-SHA256 Access=AK, SignedHeaders=");
+      const listed = authorization.match(/SignedHeaders=([^,]+)/)[1].split(";");
+      expect(listed).not.toContain("authorization");
+      expect(listed).not.toContain("accept");
+      expect(listed).not.toContain("accept-encoding");
+      expect(listed).not.toContain("user-agent");
+      expect(listed).toContain("content-type");
+      expect(listed).toContain("x-security-token");
+      // 签名里列出的每个头都必须真的随请求发出，否则服务端同样验签失败。
+      // host 例外：华为云签名规范要求它参与签名，但它是传输层按 URL 设置的，不出现在 fetch 的 headers 里。
+      for (const name of listed) {
+        if (name === "host") continue;
+        expect(headers.has(name)).toBe(true);
+      }
+      expect(listed).toContain("host");
+      expect(headers.get("host")).toBe(null);
+      expect(headers.get("x-security-token")).toBe("ST");
+      expect(headers.get("x-sdk-date")).toMatch(/^\d{8}T\d{6}Z$/);
+    });
+  });
+
+  test("maas_type 只在显式配置时才发送（benefit 渠道不存在时会被服务端拒绝）", async () => {
+    const plain = await loaderFetch();
+    await withStubFetch(async (calls) => {
+      await plain("https://example.test/api/v2/chat/completions", { method: "POST", body: "{}" });
+      expect(calls[0].headers.has("maas_type")).toBe(false);
+    });
+
+    const benefited = await loaderFetch(account(), { maasType: "benefit" });
+    await withStubFetch(async (calls) => {
+      await benefited("https://example.test/api/v2/chat/completions", { method: "POST", body: "{}" });
+      expect(calls[0].headers.get("maas_type")).toBe("benefit");
+      const listed = calls[0].headers.get("authorization").match(/SignedHeaders=([^,]+)/)[1].split(";");
+      expect(listed).toContain("maas_type");
+    });
+  });
+
+  test("STS 未过期时 401 会带上 X-Magpie-Sign-In: kept", async () => {
+    const forward = await loaderFetch();
+    const original = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response('{"error_code":"APIG.0301"}', { status: 401, headers: { "content-type": "application/json" } });
+    try {
+      const res = await forward("https://example.test/api/v2/chat/completions", { method: "POST", body: "{}" });
+      expect(res.status).toBe(401);
+      expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept");
+      expect(await res.text()).toContain("APIG.0301");
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test("STS 已过期时的 401 保持原样，交给 magpie 标记重新登录", async () => {
+    const forward = await loaderFetch({ ...account(), expires: Date.now() - 60_000 });
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => new Response("{}", { status: 401 });
+    try {
+      const res = await forward("https://example.test/api/v2/chat/completions", { method: "POST", body: "{}" });
+      expect(res.headers.get("X-Magpie-Sign-In")).toBe(null);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
+describe("额度错误分类", () => {
+  test("鉴权失败才要求重新登录", () => {
+    const described = _internal.describeQuotaError("余额", new Error("HTTP 401 Unauthorized"));
+    expect(described.signIn).toBe("expired");
+    expect(described.text).toContain("重新登录");
+  });
+
+  test("临时故障不使用会触发标记的措辞", () => {
+    const described = _internal.describeQuotaError("套餐概览", new Error("HTTP 503 Service Unavailable"));
+    expect(described.signIn).toBeUndefined();
+    expect(described.text).not.toContain("登录");
+    expect(described.text).toContain("暂时不可用");
   });
 });
