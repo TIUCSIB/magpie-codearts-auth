@@ -130,18 +130,21 @@ STS 凭证约 1 小时有效。插件用 `auth.refresh` 在到期前 10 分钟�
 
 | 现象 | 原因与处理 |
 | --- | --- |
-| `400 … TM.00001041 并发会话数已达上限(3个)` | **CodeArts 按账号限制同时活跃的会话数为 3，名额由服务端自己回收**（magpie 看不到、也关不掉这些会话；CodeArts 客户端每次启动还会注册一条新的隧道 `wss://…/tunnel/ws?clientId=codearts-agent-<机器名>-<随机>`，也占一个名额）。撞上时：等几分钟让它自然释放，把 magpie 里这个账号那一行的「并发」设在 **2 以下**（插件默认已是 2，但已保存过的账号设置不会被默认值覆盖，要手动改），并避免同时开多个对话。插件对 `TM.00001041` 会退避重试（默认 3 次），仍失败时会把上面这些写进错误信息。实测：碰撞是间歇性的，空闲时连续 8 次请求全部 200。 |
+| `InferHub.002002009.404 The model is not registered / Route missed for model: X` | 选了一个**你的账号没有的模型**（例如 `glm-5.3-flash`：平台有 `glm-5.3`，但没有这个 flash 变体）。插件现在只列 `statistics/plugin` 里 `enable` 的模型，不再把 agent-center 的平台全量列表混进来；在 magpie 里点一次「重新获取模型」并改用列表里的 id。 |
+| `provider_code=InferHub.001001005.400`（`retryable=false`） | 服务端业务错误（HTTP 400，不是网络问题）。先确认请求的模型在账号列表里 —— 用不存在的模型就是这一类；换成 `glm-5.3` / `GLM-5.2` / `deepseek-v4.1-flash` 等账号实际可用的 id。 |
+| `ModelArts.81114 Too many requests, the rate limit is 500000 tokens per minute` | 模型级的 token 限流，与并发设置无关。等一分钟再发，或换模型。 |
+| `400 … TM.00001041 并发会话数已达上限(3个)` | **CodeArts 按账号限制同时活跃的会话数为 3，名额由服务端自己回收**（magpie 看不到、也关不掉；CodeArts 客户端每次启动还会注册一条新隧道 `wss://…/tunnel/ws?clientId=codearts-agent-<机器名>-<随机>`，也占一个名额）。插件已把同一账号的在飞请求掐到 1 个（`maxInFlight`）并对 `TM.00001041` 退避重试；仍然失败时等几分钟让它自然释放。实测：碰撞是间歇性的，空闲时连续 8 次请求全部 200。 |
 | `401 … Incorrect IAM authentication information: verify ak sk signature fail` | 签名覆盖了会被改写的头（早期版本会把 `authorization` 一起签进去）。0.1.0 起只签白名单头；更新插件即可。 |
-| 账号刚登录就显示「需要重新登录」 | 409/401 被当成登录失效。先修掉上面的 401；插件现在只在真正失效时标记，并在 STS 未过期时加 `kept`。 |
+| 账号刚登录就显示「需要重新登录」 | 401/403 被当成登录失效。先修掉上面的 401；插件现在只在真正失效时标记，并在 STS 未过期时加 `kept`。 |
 | `4004 benefit not found` | 账号没有 benefit 权益渠道，却给请求加了 `maas_type=benefit`。把 `maasType` 选项留空。 |
 | `error_code 4000 invalid channel, group not found` | opengw 的权益渠道未开通（`benefit-gateway-config` 的 `enabled=false`）。这不影响对话与每日签到；插件不会把它当成错误。 |
-| 额度卡片空白 | 额度来自 `statistics/plugin`；若账号刚签到过或接口改版，可用 `codearts_balance` 看原始结果。 |
+| 额度卡片空白 | 额度来自 `statistics/plugin`；若账号刚签到过或接口改版，可用 `balance` 工具看原始结果。 |
 
 ## 测试
 
 ```bash
-bun test        # 29 个单测：签名与签名头白名单、PKCE、DPoP 验签、登录 URL、
-                # 转发回归（401 复现）、额度窗口解析、签到活动选择与幂等
+bun test        # 33 个单测：签名与签名头白名单、PKCE、DPoP 验签、登录 URL、账号字段、
+                # 转发回归（401 / 并发上限 / 在飞串行化）、额度窗口解析、模型列表过滤、签到选择与幂等
 ```
 
 ## 仓库结构
@@ -161,8 +164,11 @@ docs/reverse-engineering.md   端点与协议的出处：逆向证据链
   让 agent 调 `codearts_balance`，或开 `autoCheckin` 让每天第一次额度刷新顺带签到并回填窗口。
 - 「签到」是 CodeArts 的**每日签到活动**（`USER_LOGIN` campaign，每天 1000 积分），走
   `delivery → claim → confirm`。若账号的 benefit/education 权益渠道开通了，插件也支持那条 `/api/v1/benefit/claim` 路径。
-- 模型列表优先取 `statistics/plugin` 的 `model_metrics`（带启用状态），再用 agent-center 的细节补上下文长度与多模态；
-  未登录时展示内置默认列表（4 个）。
+- 模型列表**只报告你账号能用的那些**（`statistics/plugin` 的 `model_metrics` 里 `enable` 的），
+  并用 agent-center 的细节补上下文长度与多模态；不会把「平台有但我没权用」的 id 加进来
+  （选了那种 id，服务端回 `404 The model is not registered`）。未登录时展示内置的 4 个默认模型。
+  > agent-center 的 `gpts.models` 是**平台上存在的模型**，不等于你这个账号可用的模型。两者混在一起
+  > 正是 `glm-5.3-flash`（不存在）被列进 magpie、进而报 `InferHub.002002009.404` 的原因，已修。
 - `usageTokenChatMessages` 之类的字段不是额度（例如 `package_token_amount` 为 1 却用了 1300 万 token），
   插件会跳过这类不成比例的窗口，避免给出误导数字。
 - 插件只把你的请求发到 CodeArts 自己的域名，不经过任何第三方。

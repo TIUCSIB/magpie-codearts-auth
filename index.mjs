@@ -32,11 +32,12 @@ const AUTH_REDIRECT_PATH = "/oauth/callback";
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const USER_AGENT = `opencode-codearts-auth/0.1.0`;
 
-// 未登录 / 列表接口不可用时展示的模型（真实存在的 inferhub 模型名，登录后会被账号列表覆盖）
+// 未登录 / 列表接口不可用时展示的模型：全部取自账号侧 statistics/plugin 的 model_metrics，
+// 不要放账号里没有的 id —— 选了不存在的模型，服务端会回 404 "The model is not registered"。
 const DEFAULT_MODELS = {
-  "GLM-5.1": { name: "GLM-5.1", context: 200000, output: 64000, reasoning: true, image: false },
-  "Qwen3.6-27B-VL": { name: "Qwen3.6-27B-VL", context: 131072, output: 32768, reasoning: true, image: true },
-  "maas-glm-4.7": { name: "GLM-4.7 (MaaS)", context: 131072, output: 32768, reasoning: true, image: false },
+  "GLM-5.2": { name: "GLM-5.2", context: 200000, output: 64000, reasoning: true, image: false },
+  "glm-5.3": { name: "GLM-5.3", context: 200000, output: 64000, reasoning: true, image: false },
+  "deepseek-v4.1-flash": { name: "DeepSeek-V4.1-Flash", context: 128000, output: 32000, reasoning: true, image: false },
   "Qwen3-VL-235B": { name: "Qwen3-VL-235B", context: 131072, output: 32768, reasoning: true, image: true },
 };
 
@@ -670,6 +671,23 @@ function creditsFromStats(stats) {
   };
 }
 
+/**
+ * 把 agent-center 的模型细节并进「账号可用的模型」列表。
+ * 只补细节、不加新 id：agent-center 列的是平台上存在的模型，账号未必有权使用。
+ */
+function mergeModelDetails(available, detailed) {
+  const byId = new Map(available.map((model) => [model.id, { ...model }]));
+  for (const model of Array.isArray(detailed) ? detailed : []) {
+    const existing = byId.get(model.id);
+    if (!existing) continue;
+    existing.context = existing.context ?? model.context;
+    existing.output = existing.output ?? model.output;
+    existing.image = existing.image ?? model.image;
+    existing.reasoning = existing.reasoning ?? model.reasoning;
+  }
+  return [...byId.values()];
+}
+
 /** 账号可用的模型：statistics/plugin 的 model_metrics。 */
 function modelsFromStats(stats) {
   const models = Array.isArray(stats?.model_metrics) ? stats.model_metrics : [];
@@ -1000,7 +1018,7 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
   };
 
   return {
-    // 供应商声明：magpie 未登录时也能列出这些模型
+    // 供应商声明：magpie 未登录时也能列出这些模型（都是账号侧确认可用的 id）
     async config(cfg) {
       cfg.provider ??= {};
       cfg.provider[PROVIDER] ??= {
@@ -1225,21 +1243,13 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
         } catch {
           found = [];
         }
-        // 用 agent-center 的细节补上下文长度与多模态
+        // 用 agent-center 的细节补上下文长度与多模态。
+        // 注意：agent-center 返回的是「平台有的模型」，不是「这个账号能用的」，
+        // 所以只允许补细节，绝不允许把里面多出来的 id 加进列表 ——
+        // 选了账号没有的模型，服务端会回 404 InferHub.002002009 "The model is not registered"。
         try {
           const detailed = await fetchBuiltinModels(auth);
-          const byId = new Map(found.map((model) => [model.id, model]));
-          for (const model of detailed) {
-            const existing = byId.get(model.id);
-            if (existing) {
-              existing.context = existing.context ?? model.context;
-              existing.output = existing.output ?? model.output;
-              existing.image = existing.image ?? model.image;
-              existing.reasoning = existing.reasoning ?? model.reasoning;
-            } else {
-              found.push(model);
-            }
-          }
+          found = mergeModelDetails(found, detailed);
         } catch {
           /* 细节拿不到就用账号列表 */
         }
@@ -1417,6 +1427,7 @@ export const _internal = {
   packageWindows,
   creditsFromStats,
   modelsFromStats,
+  mergeModelDetails,
   fetchQuotaStats,
   pickCheckinCampaign,
   noClaimableCheckin,

@@ -255,6 +255,19 @@ describe("模型列表与签到活动", () => {
     expect(models[0]).toEqual({ id: "GLM-5.2", name: "GLM-5.2", description: "旗舰", quota: undefined, luxury: false });
   });
 
+  test("不会把账号没有的模型加进列表（glm-5.3-flash 会 404 not registered）", () => {
+    const merged = _internal.mergeModelDetails(
+      [{ id: "glm-5.3", name: "GLM-5.3" }],
+      [
+        { id: "glm-5.3", context: 200000, output: 64000, image: false },
+        { id: "glm-5.3-flash", context: 128000 },
+      ],
+    );
+    expect(merged.map((model) => model.id)).toEqual(["glm-5.3"]);
+    expect(merged[0].context).toBe(200000);
+    expect(merged[0].output).toBe(64000);
+  });
+
   test("签到优先选 USER_LOGIN 且只挑可领取的活动", () => {
     const items = [
       { campaignId: 4, type: "NEW_USER_REGISTER", claimable: false, title: "新用户注册送 4000 积分" },
