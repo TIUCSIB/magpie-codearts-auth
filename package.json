@@ -31,14 +31,17 @@
     "test": "bun test"
   },
   "magpie": {
-    "icon": "./icon.svg",
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgcm9sZT0iaW1nIiBhcmlhLWxhYmVsPSJDb2RlQXJ0cyI+IDxkZWZzPiA8bGluZWFyR3JhZGllbnQgaWQ9ImciIHgxPSIwIiB5MT0iMCIgeDI9IjEiIHkyPSIxIj4gPHN0b3Agb2Zmc2V0PSIwIiBzdG9wLWNvbG9yPSIjN2I1Y2ZmIi8+IDxzdG9wIG9mZnNldD0iMSIgc3RvcC1jb2xvcj0iIzIyYjhmZiIvPiA8L2xpbmVhckdyYWRpZW50PiA8L2RlZnM+IDxyZWN0IHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgcng9IjE0IiBmaWxsPSJ1cmwoI2cpIi8+IDxwYXRoIGQ9Ik0yMyAxOSAxMSAzMmwxMiAxM000MSAxOWwxMiAxMy0xMiAxMyIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjZmZmZmZmIiBzdHJva2Utd2lkdGg9IjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPiA8Y2lyY2xlIGN4PSIzMiIgY3k9IjMyIiByPSI0LjIiIGZpbGw9IiNmZmZmZmYiLz4gPC9zdmc+",
     "maxConcurrency": 2,
     "panels": [
       {
         "slot": "provider",
         "file": "panel/checkin.html",
         "title": "每日签到",
-        "titles": { "zh": "每日签到", "en": "Daily check-in" }
+        "titles": {
+          "zh": "每日签到",
+          "en": "Daily check-in"
+        }
       }
     ],
     "options": {

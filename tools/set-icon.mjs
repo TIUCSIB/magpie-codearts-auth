@@ -1,0 +1,10 @@
+﻿import fs from "node:fs";
+const svg = fs.readFileSync("icon.svg", "utf8").replace(/\s+/g, " ").trim();
+const dataUri = `data:image/svg+xml;base64,${Buffer.from(svg, "utf8").toString("base64")}`;
+const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+pkg.magpie.icon = dataUri;
+pkg.files = pkg.files.includes("icon.svg") ? pkg.files : [...pkg.files, "icon.svg"];
+fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+console.log("icon 前缀:", dataUri.slice(0, 60), "…");
+console.log("icon 长度:", dataUri.length, "字符");
+console.log("图标可解码:", Buffer.from(dataUri.split(",")[1], "base64").toString("utf8").startsWith("<svg"));
