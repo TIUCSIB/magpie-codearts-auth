@@ -1,5 +1,5 @@
 /**
- * opencode-codearts-auth
+ * magpie-codearts-auth
  *
  * Magpie / OpenCode provider plugin for HUAWEI CodeArts（码道 CodeArts Doer）。
  *
@@ -30,7 +30,7 @@ const INFERHUB_BASE = `${SNAP_ENGINE}/api/v2/`;
 const BENEFIT_API = "https://opengw.developer.huaweicloud.com";
 const AUTH_REDIRECT_PATH = "/oauth/callback";
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
-const USER_AGENT = `opencode-codearts-auth/0.1.0`;
+const USER_AGENT = `magpie-codearts-auth/0.1.1`;
 
 // 未登录 / 列表接口不可用时展示的模型：全部取自账号侧 statistics/plugin 的 model_metrics，
 // 不要放账号里没有的 id —— 选了不存在的模型，服务端会回 404 "The model is not registered"。
@@ -283,8 +283,8 @@ async function forwardSigned(auth, opts, input, init) {
   headers.set("x-language", "zh-cn");
   headers.set("plugin-name", PLUGIN_NAME);
   headers.set("plugin-version", PLUGIN_VERSION);
-  headers.set("x-ot-client-type", "opencode-codearts-auth");
-  headers.set("x-ot-client-version", "0.1.0");
+  headers.set("x-ot-client-type", "magpie-codearts-auth");
+  headers.set("x-ot-client-version", "0.1.1");
   if (opts?.maasType) headers.set("maas_type", opts.maasType);
   else headers.delete("maas_type");
 
@@ -1155,8 +1155,8 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
               headers.delete("authorization");
               headers.set("x-auth-token", auth.key);
               if (opts.maasType) headers.set("maas_type", opts.maasType);
-              headers.set("x-ot-client-type", "opencode-codearts-auth");
-              headers.set("x-ot-client-version", "0.1.0");
+              headers.set("x-ot-client-type", "magpie-codearts-auth");
+              headers.set("x-ot-client-version", "0.1.1");
               return fetch(input, { ...init, headers });
             },
           };
@@ -1296,8 +1296,8 @@ export const CodeArtsAuthPlugin = async ({ directory }, pluginOptions) => {
       const opts = await getOptions();
       if (input?.model?.providerID !== PROVIDER) return;
       if (opts.maasType) output.headers["maas_type"] = opts.maasType;
-      output.headers["x-ot-client-type"] = "opencode-codearts-auth";
-      output.headers["x-ot-client-version"] = "0.1.0";
+      output.headers["x-ot-client-type"] = "magpie-codearts-auth";
+      output.headers["x-ot-client-version"] = "0.1.1";
     },
 
     /** 签到相关工具，经 magpie 的内置 MCP（/mcp/magpie/tools）给任意 agent。 */

@@ -24,7 +24,7 @@ const incoming = {
   accept: "*/*",
   "user-agent": "Bun/1.4.3",
   "accept-encoding": "gzip, deflate",
-  "x-ot-client-type": "opencode-codearts-auth",
+  "x-ot-client-type": "magpie-codearts-auth",
   "x-ot-client-version": "0.1.0",
 };
 

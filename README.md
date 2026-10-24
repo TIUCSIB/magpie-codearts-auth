@@ -1,4 +1,4 @@
-# opencode-codearts-auth
+# magpie-codearts-auth
 
 Magpie（usemagpie.ai）供应商插件：用你的华为云 **CodeArts（码道）** 账号登录，把 CodeArts 的
 inferhub 模型接进 magpie —— Claude Code / Codex / OpenCode / Gemini CLI 等所有 agent 都能用，

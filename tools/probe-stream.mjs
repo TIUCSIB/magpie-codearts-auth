@@ -15,7 +15,7 @@ const send = async (label, body) => {
     "content-type": "application/json",
     "x-security-token": auth.securityToken,
     "x-language": "zh-cn",
-    "x-ot-client-type": "opencode-codearts-auth",
+    "x-ot-client-type": "magpie-codearts-auth",
     "x-ot-client-version": "0.1.0",
     "plugin-name": "snap_AIIDE",
     "plugin-version": "5.1.0",
@@ -50,7 +50,7 @@ const headers = {
   "content-type": "application/json",
   "x-security-token": auth.securityToken,
   "x-language": "zh-cn",
-  "x-ot-client-type": "opencode-codearts-auth",
+  "x-ot-client-type": "magpie-codearts-auth",
   "x-ot-client-version": "0.1.0",
 };
 const signed = signRequest({ method: "POST", url, headers, body }, auth.accessKey, auth.secretKey);

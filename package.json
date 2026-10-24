@@ -1,6 +1,6 @@
 {
-  "name": "opencode-codearts-auth",
-  "version": "0.1.0",
+  "name": "magpie-codearts-auth",
+  "version": "0.1.1",
   "description": "Magpie / OpenCode provider plugin for HUAWEI CodeArts (码道): OAuth2 login, balance & quota reminders, daily check-in",
   "type": "module",
   "main": "./index.mjs",
